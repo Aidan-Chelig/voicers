@@ -16,16 +16,20 @@ license = "MIT"
 anyhow = "1.0.102"
 audiopus = "0.3.0-rc.0"
 audiopus_sys = { version = "0.2.2", features = ["static"] }
+bytes = "1.11.0"
 cpal = "0.15.3"
 crossterm = "0.29.0"
 futures = "0.3.32"
-libp2p = { version = "0.56.0", features = ["cbor", "ed25519", "identify", "macros", "noise", "ping", "request-response", "tcp", "tokio", "upnp", "yamux"] }
+libp2p = { version = "0.56.0", features = ["cbor", "dcutr", "dns", "ed25519", "identify", "kad", "macros", "noise", "ping", "relay", "request-response", "tcp", "tokio", "upnp", "yamux"] }
 pipewire = "0.9.2"
 ratatui = "0.30.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tokio = { version = "1.52.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.18", features = ["codec"] }
+webrtc = "0.17.1"
+webrtc-ice = "0.17.1"
+webrtc-util = "0.17.1"
 
 [patch.crates-io]
 audiopus_sys = { path = "vendor" }

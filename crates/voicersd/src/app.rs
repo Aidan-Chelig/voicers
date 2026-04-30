@@ -7,6 +7,8 @@ use voicers_core::{
     NetworkSummary, OutputStrategy, SessionHello, SessionSummary, DEFAULT_CONTROL_ADDR,
 };
 
+#[cfg(feature = "webrtc-transport")]
+use crate::webrtc_transport::{self, WebRtcTransportConfig};
 use crate::{
     media,
     network::{self, NetworkHandle},
@@ -17,8 +19,21 @@ use crate::{
 pub struct AppConfig {
     pub control_addr: String,
     pub listen_addr: String,
+    pub relay_addr: Option<String>,
+    pub bootstrap_addrs: Vec<String>,
+    pub stun_servers: Vec<String>,
+    pub turn_servers: Vec<TurnServerConfig>,
+    pub enable_stun: bool,
     pub display_name: String,
     pub state_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "webrtc-transport"), allow(dead_code))]
+pub struct TurnServerConfig {
+    pub url: String,
+    pub username: String,
+    pub credential: String,
 }
 
 impl Default for AppConfig {
@@ -26,6 +41,11 @@ impl Default for AppConfig {
         Self {
             control_addr: DEFAULT_CONTROL_ADDR.to_string(),
             listen_addr: "/ip4/0.0.0.0/tcp/0".to_string(),
+            relay_addr: None,
+            bootstrap_addrs: Vec::new(),
+            stun_servers: Vec::new(),
+            turn_servers: Vec::new(),
+            enable_stun: true,
             display_name: "local-user".to_string(),
             state_path: persist::default_state_path(),
         }
@@ -66,6 +86,10 @@ impl App {
                 listen_addrs: Vec::new(),
                 external_addrs: Vec::new(),
                 observed_addrs: Vec::new(),
+                stun_addrs: Vec::new(),
+                selected_media_path: "libp2p-request-response".to_string(),
+                webrtc_connection_state: "disabled".to_string(),
+                path_scores: persisted.path_scores,
                 saved_peer_addrs: persisted.known_peer_addrs,
                 known_peers: persisted.known_peers,
                 ignored_peer_ids: persisted.ignored_peer_ids,
@@ -93,15 +117,47 @@ impl App {
             ],
         }));
         let media = media::start(Arc::clone(&state)).await;
-        let network =
-            network::start(
-                Arc::clone(&state),
-                &config.listen_addr,
-                media.clone(),
-                persistence.clone(),
-            )?;
+        #[cfg(feature = "webrtc-transport")]
+        let (webrtc, webrtc_signals, webrtc_media_frames, webrtc_connection_states) =
+            webrtc_transport::start(WebRtcTransportConfig {
+                stun_servers: config.stun_servers.clone(),
+                turn_servers: config
+                    .turn_servers
+                    .iter()
+                    .map(|server| webrtc_transport::TurnServerConfig {
+                        url: server.url.clone(),
+                        username: server.username.clone(),
+                        credential: server.credential.clone(),
+                    })
+                    .collect(),
+            })?;
+        let network = network::start(
+            Arc::clone(&state),
+            &config.listen_addr,
+            config.relay_addr.as_deref(),
+            &config.bootstrap_addrs,
+            &config.stun_servers,
+            config.enable_stun,
+            #[cfg(feature = "webrtc-transport")]
+            Some(webrtc),
+            #[cfg(feature = "webrtc-transport")]
+            webrtc_signals,
+            #[cfg(feature = "webrtc-transport")]
+            webrtc_media_frames,
+            #[cfg(feature = "webrtc-transport")]
+            webrtc_connection_states,
+            media.clone(),
+            persistence.clone(),
+        )?;
 
-        state.write().await.local_peer_id = network.peer_id;
+        {
+            let mut state = state.write().await;
+            state.local_peer_id = network.peer_id;
+            #[cfg(feature = "webrtc-transport")]
+            {
+                state.network.webrtc_connection_state = "idle".to_string();
+            }
+        }
 
         Ok(Self {
             state,
@@ -188,6 +244,31 @@ impl App {
                     message: format!("nickname set to {new_name}"),
                 }
             }
+            ControlRequest::SendWebRtcSignal { peer_id, signal } => {
+                let signal_kind = signal.kind();
+                match self
+                    .network
+                    .send_webrtc_signal(peer_id.clone(), signal)
+                    .await
+                {
+                    Ok(()) => ControlResponse::Ack {
+                        message: format!("sent WebRTC {signal_kind} signal to {peer_id}"),
+                    },
+                    Err(error) => ControlResponse::Error {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            ControlRequest::StartWebRtcOffer { peer_id } => {
+                match self.network.start_webrtc_offer(peer_id.clone()).await {
+                    Ok(()) => ControlResponse::Ack {
+                        message: format!("started WebRTC offer for {peer_id}"),
+                    },
+                    Err(error) => ControlResponse::Error {
+                        message: error.to_string(),
+                    },
+                }
+            }
             ControlRequest::SetInputGainPercent { percent } => {
                 let percent = percent.min(200);
                 match self.media.set_input_gain_percent(percent).await {
@@ -258,19 +339,25 @@ impl App {
                     }
                     existing.display_name.clone()
                 } else if let Some(live_peer) = live_peer {
-                    state.network.known_peers.push(voicers_core::KnownPeerSummary {
-                        peer_id: live_peer.peer_id.clone(),
-                        display_name: live_peer.display_name.clone(),
-                        addresses: if live_peer.address != "<unknown>" {
-                            vec![live_peer.address.clone()]
-                        } else {
-                            Vec::new()
-                        },
-                        last_dial_addr: (live_peer.address != "<unknown>")
-                            .then_some(live_peer.address.clone()),
-                        connected: matches!(live_peer.transport, voicers_core::PeerTransportState::Connected),
-                        pinned: true,
-                    });
+                    state
+                        .network
+                        .known_peers
+                        .push(voicers_core::KnownPeerSummary {
+                            peer_id: live_peer.peer_id.clone(),
+                            display_name: live_peer.display_name.clone(),
+                            addresses: if live_peer.address != "<unknown>" {
+                                vec![live_peer.address.clone()]
+                            } else {
+                                Vec::new()
+                            },
+                            last_dial_addr: (live_peer.address != "<unknown>")
+                                .then_some(live_peer.address.clone()),
+                            connected: matches!(
+                                live_peer.transport,
+                                voicers_core::PeerTransportState::Connected
+                            ),
+                            pinned: true,
+                        });
                     live_peer.display_name
                 } else {
                     return ControlResponse::Error {
@@ -285,7 +372,10 @@ impl App {
                     message: format!("{known_peer} saved"),
                 }
             }
-            ControlRequest::RenameKnownPeer { peer_id, display_name } => {
+            ControlRequest::RenameKnownPeer {
+                peer_id,
+                display_name,
+            } => {
                 let new_name = display_name.trim().to_string();
                 if new_name.is_empty() {
                     return ControlResponse::Error {
@@ -324,7 +414,10 @@ impl App {
             ControlRequest::ForgetKnownPeer { peer_id } => {
                 let mut state = self.state.write().await;
                 let before = state.network.known_peers.len();
-                state.network.known_peers.retain(|peer| peer.peer_id != peer_id);
+                state
+                    .network
+                    .known_peers
+                    .retain(|peer| peer.peer_id != peer_id);
                 if before == state.network.known_peers.len() {
                     return ControlResponse::Error {
                         message: "known peer not found".to_string(),
@@ -351,6 +444,7 @@ impl App {
             known_peers: network.known_peers,
             ignored_peer_ids: network.ignored_peer_ids,
             last_share_invite: network.share_invite,
+            path_scores: network.path_scores,
         })
     }
 
@@ -362,6 +456,7 @@ impl App {
             known_peers: state.network.known_peers.clone(),
             ignored_peer_ids: state.network.ignored_peer_ids.clone(),
             last_share_invite: state.network.share_invite.clone(),
+            path_scores: state.network.path_scores.clone(),
         })
     }
 }

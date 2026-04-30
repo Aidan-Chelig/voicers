@@ -4,9 +4,11 @@ mod control;
 mod media;
 mod network;
 mod persist;
+#[cfg(feature = "webrtc-transport")]
+mod webrtc_transport;
 
 use anyhow::Result;
-use app::AppConfig;
+use app::{AppConfig, TurnServerConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -30,6 +32,31 @@ fn parse_args() -> AppConfig {
                     config.listen_addr = value;
                 }
             }
+            "--relay-addr" => {
+                if let Some(value) = args.next() {
+                    config.relay_addr = Some(value);
+                }
+            }
+            "--bootstrap-addr" => {
+                if let Some(value) = args.next() {
+                    config.bootstrap_addrs.push(value);
+                }
+            }
+            "--stun-server" => {
+                if let Some(value) = args.next() {
+                    config.stun_servers.push(value);
+                }
+            }
+            "--turn-server" => {
+                if let Some(value) = args.next() {
+                    if let Some(server) = parse_turn_server(&value) {
+                        config.turn_servers.push(server);
+                    }
+                }
+            }
+            "--no-stun" => {
+                config.enable_stun = false;
+            }
             "--display-name" => {
                 if let Some(value) = args.next() {
                     config.display_name = value;
@@ -45,4 +72,13 @@ fn parse_args() -> AppConfig {
     }
 
     config
+}
+
+fn parse_turn_server(value: &str) -> Option<TurnServerConfig> {
+    let mut parts = value.splitn(3, ',');
+    Some(TurnServerConfig {
+        url: parts.next()?.to_string(),
+        username: parts.next().unwrap_or_default().to_string(),
+        credential: parts.next().unwrap_or_default().to_string(),
+    })
 }

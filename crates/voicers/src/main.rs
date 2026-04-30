@@ -157,14 +157,9 @@ impl UiApp {
                     .cloned()
                     .map(ConfigItem::CaptureDevice),
             );
-            items.extend(
-                status
-                    .peers
-                    .iter()
-                    .map(|peer| ConfigItem::PeerVolume {
-                        peer_id: peer.peer_id.clone(),
-                    }),
-            );
+            items.extend(status.peers.iter().map(|peer| ConfigItem::PeerVolume {
+                peer_id: peer.peer_id.clone(),
+            }));
         }
         items
     }
@@ -528,7 +523,8 @@ async fn handle_text_input(app: &mut UiApp, key: KeyCode, mode: InputMode) {
                 refresh_status(app).await;
             }
             InputMode::RenameKnownPeer => {
-                let Some(peer_id) = app.selected_known_peer().map(|peer| peer.peer_id.clone()) else {
+                let Some(peer_id) = app.selected_known_peer().map(|peer| peer.peer_id.clone())
+                else {
                     app.set_flash("no known peer selected");
                     app.input_mode = InputMode::Normal;
                     return;
@@ -694,11 +690,8 @@ async fn reconnect_selected_known_peer(app: &mut UiApp) {
         return;
     };
 
-    let response = client::send_request_to(
-        &app.control_addr,
-        ControlRequest::JoinPeer { address },
-    )
-    .await;
+    let response =
+        client::send_request_to(&app.control_addr, ControlRequest::JoinPeer { address }).await;
     app.set_flash(render_message(response));
     refresh_status(app).await;
 }
@@ -709,11 +702,8 @@ async fn save_selected_known_peer(app: &mut UiApp) {
         return;
     };
 
-    let response = client::send_request_to(
-        &app.control_addr,
-        ControlRequest::SaveKnownPeer { peer_id },
-    )
-    .await;
+    let response =
+        client::send_request_to(&app.control_addr, ControlRequest::SaveKnownPeer { peer_id }).await;
     app.set_flash(render_message(response));
     refresh_status(app).await;
 }
@@ -724,11 +714,8 @@ async fn save_selected_live_peer(app: &mut UiApp) {
         return;
     };
 
-    let response = client::send_request_to(
-        &app.control_addr,
-        ControlRequest::SaveKnownPeer { peer_id },
-    )
-    .await;
+    let response =
+        client::send_request_to(&app.control_addr, ControlRequest::SaveKnownPeer { peer_id }).await;
     app.set_flash(render_message(response));
     refresh_status(app).await;
 }
@@ -1031,6 +1018,34 @@ fn draw_summary(frame: &mut Frame, app: &UiApp, area: Rect) {
                     Style::default().fg(color_muted()),
                 ),
             ]),
+            Line::from(vec![
+                label("STUN"),
+                Span::raw(" "),
+                Span::styled(
+                    if status.network.stun_addrs.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        status.network.stun_addrs.join(", ")
+                    },
+                    Style::default().fg(color_muted()),
+                ),
+            ]),
+            Line::from(vec![
+                label("MEDIA"),
+                Span::raw(" "),
+                Span::styled(
+                    status.network.selected_media_path.clone(),
+                    Style::default().fg(color_text()),
+                ),
+            ]),
+            Line::from(vec![
+                label("WEBRTC"),
+                Span::raw(" "),
+                Span::styled(
+                    status.network.webrtc_connection_state.clone(),
+                    Style::default().fg(color_muted()),
+                ),
+            ]),
         ]
     } else {
         vec![
@@ -1267,18 +1282,20 @@ fn draw_config_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
                 Line::from(vec![
                     Span::styled(
                         device_name.clone(),
-                        Style::default()
-                            .fg(color_text())
-                            .add_modifier(if selected {
-                                Modifier::BOLD
-                            } else {
-                                Modifier::empty()
-                            }),
+                        Style::default().fg(color_text()).add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
                     ),
                     Span::raw("  "),
                     badge(
                         if selected { "active" } else { "available" },
-                        if selected { color_accent() } else { color_panel_alt() },
+                        if selected {
+                            color_accent()
+                        } else {
+                            color_panel_alt()
+                        },
                         color_bg(),
                     ),
                 ]),
@@ -1449,7 +1466,12 @@ fn known_peer_lines(peer: &KnownPeerSummary) -> Vec<Line<'static>> {
     } else {
         peer.addresses
             .iter()
-            .map(|addr| Line::from(Span::styled(addr.clone(), Style::default().fg(color_subtle()))))
+            .map(|addr| {
+                Line::from(Span::styled(
+                    addr.clone(),
+                    Style::default().fg(color_subtle()),
+                ))
+            })
             .collect()
     };
 
@@ -1463,7 +1485,11 @@ fn known_peer_lines(peer: &KnownPeerSummary) -> Vec<Line<'static>> {
             ),
             Span::raw("  "),
             badge(
-                if peer.connected { "connected" } else { "offline" },
+                if peer.connected {
+                    "connected"
+                } else {
+                    "offline"
+                },
                 if peer.connected {
                     color_good()
                 } else {

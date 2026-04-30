@@ -33,6 +33,14 @@ pub struct NetworkSummary {
     #[serde(default)]
     pub observed_addrs: Vec<String>,
     #[serde(default)]
+    pub stun_addrs: Vec<String>,
+    #[serde(default)]
+    pub selected_media_path: String,
+    #[serde(default)]
+    pub webrtc_connection_state: String,
+    #[serde(default)]
+    pub path_scores: Vec<PathScoreSummary>,
+    #[serde(default)]
     pub saved_peer_addrs: Vec<String>,
     #[serde(default)]
     pub known_peers: Vec<KnownPeerSummary>,
@@ -40,6 +48,14 @@ pub struct NetworkSummary {
     pub ignored_peer_ids: Vec<String>,
     #[serde(default)]
     pub share_invite: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathScoreSummary {
+    pub path: String,
+    pub successes: u64,
+    pub failures: u64,
+    pub last_peer_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +141,7 @@ pub enum OutputStrategy {
     PipeWirePeerNodesActive,
     JackPeerPortsPlanned,
     CoreAudioPeerBusesPlanned,
+    CoreAudioMixedOutputActive,
     WasapiPeerBusesPlanned,
     LogicalPeerBusesOnly,
 }
@@ -235,29 +252,89 @@ pub struct SessionHello {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WebRtcSignal {
+    Offer {
+        sdp: String,
+    },
+    Answer {
+        sdp: String,
+    },
+    IceCandidate {
+        candidate: String,
+        #[serde(default)]
+        sdp_mid: Option<String>,
+        #[serde(default)]
+        sdp_mline_index: Option<u16>,
+    },
+    IceComplete,
+}
+
+impl WebRtcSignal {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Offer { .. } => "offer",
+            Self::Answer { .. } => "answer",
+            Self::IceCandidate { .. } => "ice-candidate",
+            Self::IceComplete => "ice-complete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionRequest {
     Hello(SessionHello),
+    WebRtcSignal(WebRtcSignal),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionResponse {
     HelloAck(SessionHello),
+    WebRtcSignalAck { signal_kind: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlRequest {
     GetStatus,
-    CreateRoom { room_name: String },
-    JoinPeer { address: String },
+    CreateRoom {
+        room_name: String,
+    },
+    JoinPeer {
+        address: String,
+    },
     ToggleMuteSelf,
-    ToggleMutePeer { peer_id: String },
-    SetInputGainPercent { percent: u8 },
-    SelectCaptureDevice { device_name: String },
-    SetPeerVolumePercent { peer_id: String, percent: u8 },
-    SetDisplayName { display_name: String },
-    SaveKnownPeer { peer_id: String },
-    RenameKnownPeer { peer_id: String, display_name: String },
-    ForgetKnownPeer { peer_id: String },
+    ToggleMutePeer {
+        peer_id: String,
+    },
+    SetInputGainPercent {
+        percent: u8,
+    },
+    SelectCaptureDevice {
+        device_name: String,
+    },
+    SetPeerVolumePercent {
+        peer_id: String,
+        percent: u8,
+    },
+    SetDisplayName {
+        display_name: String,
+    },
+    StartWebRtcOffer {
+        peer_id: String,
+    },
+    SendWebRtcSignal {
+        peer_id: String,
+        signal: WebRtcSignal,
+    },
+    SaveKnownPeer {
+        peer_id: String,
+    },
+    RenameKnownPeer {
+        peer_id: String,
+        display_name: String,
+    },
+    ForgetKnownPeer {
+        peer_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
