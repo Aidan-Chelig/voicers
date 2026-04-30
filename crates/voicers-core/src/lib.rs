@@ -35,7 +35,24 @@ pub struct NetworkSummary {
     #[serde(default)]
     pub saved_peer_addrs: Vec<String>,
     #[serde(default)]
+    pub known_peers: Vec<KnownPeerSummary>,
+    #[serde(default)]
+    pub ignored_peer_ids: Vec<String>,
+    #[serde(default)]
     pub share_invite: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnownPeerSummary {
+    pub peer_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub addresses: Vec<String>,
+    pub last_dial_addr: Option<String>,
+    #[serde(default)]
+    pub connected: bool,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +254,10 @@ pub enum ControlRequest {
     SetInputGainPercent { percent: u8 },
     SelectCaptureDevice { device_name: String },
     SetPeerVolumePercent { peer_id: String, percent: u8 },
+    SetDisplayName { display_name: String },
+    SaveKnownPeer { peer_id: String },
+    RenameKnownPeer { peer_id: String, display_name: String },
+    ForgetKnownPeer { peer_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

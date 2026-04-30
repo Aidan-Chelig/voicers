@@ -10,8 +10,9 @@ use libp2p::{
 };
 use tokio::sync::{mpsc, oneshot, RwLock};
 use voicers_core::{
-    DaemonStatus, MediaRequest, MediaResponse, MediaStreamState, PeerMediaState, PeerSessionState,
-    PeerSummary, PeerTransportState, SessionHello, SessionRequest, SessionResponse,
+    DaemonStatus, KnownPeerSummary, MediaRequest, MediaResponse, MediaStreamState,
+    PeerMediaState, PeerSessionState, PeerSummary, PeerTransportState, SessionHello,
+    SessionRequest, SessionResponse,
 };
 
 use std::sync::Arc;
@@ -278,22 +279,32 @@ async fn handle_swarm_event(
             num_established,
             ..
         } => {
-            let mut state = state.write().await;
-            if let Some(peer) = state
-                .peers
-                .iter_mut()
-                .find(|existing| existing.peer_id == peer_id.to_string())
             {
-                peer.transport = if num_established == 0 {
-                    PeerTransportState::Disconnected
-                } else {
-                    PeerTransportState::Connected
-                };
+                let mut state = state.write().await;
+                if let Some(peer) = state
+                    .peers
+                    .iter_mut()
+                    .find(|existing| existing.peer_id == peer_id.to_string())
+                {
+                    peer.transport = if num_established == 0 {
+                        PeerTransportState::Disconnected
+                    } else {
+                        PeerTransportState::Connected
+                    };
+                }
+                if let Some(known_peer) = state
+                    .network
+                    .known_peers
+                    .iter_mut()
+                    .find(|existing| existing.peer_id == peer_id.to_string())
+                {
+                    known_peer.connected = num_established > 0;
+                }
+                insert_unique_note(&mut state, format!("connection closed with {peer_id}"));
             }
-            insert_unique_note(&mut state, format!("connection closed with {peer_id}"));
-            drop(state);
             active_media_flows.remove(&peer_id.to_string());
             let _ = media.disconnect_peer(peer_id.to_string()).await;
+            persist_network_snapshot(state, persistence).await;
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             push_note(
@@ -329,14 +340,21 @@ async fn handle_swarm_event(
                         info.agent_version
                     };
                     peer.transport = PeerTransportState::Connected;
-                    peer.peer_id.clone()
+                    (peer.peer_id.clone(), peer.display_name.clone())
                 };
+                update_known_peer(
+                    &mut state,
+                    &identified_peer.0,
+                    None,
+                    Some(identified_peer.1.clone()),
+                    true,
+                );
                 if !observed_addr.is_empty() {
                     insert_unique_addr(&mut state.network.observed_addrs, observed_addr.clone());
                     state.network.nat_status = "observed by remote peers".to_string();
                 }
                 update_share_invite(&mut state);
-                insert_unique_note(&mut state, format!("identified peer {identified_peer}"));
+                insert_unique_note(&mut state, format!("identified peer {}", identified_peer.0));
             }
             persist_network_snapshot(state, persistence).await;
         }
@@ -427,6 +445,7 @@ async fn handle_swarm_event(
                 ..
             } => {
                 apply_session_hello(state, peer.to_string(), hello.clone()).await;
+                persist_network_snapshot(state, persistence).await;
                 let _ = media.register_peer(peer.to_string()).await;
 
                 let response = {
@@ -456,6 +475,7 @@ async fn handle_swarm_event(
                 ..
             } => {
                 apply_session_hello(state, peer.to_string(), hello).await;
+                persist_network_snapshot(state, persistence).await;
                 let _ = media.register_peer(peer.to_string()).await;
                 push_note(state, format!("session hello acknowledged by {peer}")).await;
                 if active_media_flows.insert(peer.to_string()) {
@@ -608,6 +628,13 @@ async fn upsert_peer(
     if peer_clone.address != "<unknown>" {
         insert_unique_addr(&mut state.network.saved_peer_addrs, peer_clone.address.clone());
     }
+    update_known_peer(
+        &mut state,
+        &peer_clone.peer_id,
+        Some(peer_clone.address.clone()),
+        Some(peer_clone.display_name.clone()),
+        true,
+    );
     peer_clone
 }
 
@@ -675,21 +702,32 @@ async fn apply_session_hello(
     hello: SessionHello,
 ) {
     let mut state = state.write().await;
-    let peer = if let Some(index) = state
-        .peers
-        .iter()
-        .position(|existing| existing.peer_id == peer_id)
-    {
-        &mut state.peers[index]
-    } else {
-        get_or_insert_peer(&mut state, peer_id, "<unknown>".to_string())
+    let display_name = hello.display_name.clone();
+    let (peer_id, peer_address) = {
+        let peer = if let Some(index) = state
+            .peers
+            .iter()
+            .position(|existing| existing.peer_id == peer_id)
+        {
+            &mut state.peers[index]
+        } else {
+            get_or_insert_peer(&mut state, peer_id, "<unknown>".to_string())
+        };
+        peer.display_name = hello.display_name.clone();
+        peer.session = PeerSessionState::Active {
+            room_name: hello.room_name,
+            display_name: hello.display_name,
+        };
+        peer.transport = PeerTransportState::Connected;
+        (peer.peer_id.clone(), peer.address.clone())
     };
-    peer.display_name = hello.display_name.clone();
-    peer.session = PeerSessionState::Active {
-        room_name: hello.room_name,
-        display_name: hello.display_name,
-    };
-    peer.transport = PeerTransportState::Connected;
+    update_known_peer(
+        &mut state,
+        &peer_id,
+        Some(peer_address),
+        Some(display_name),
+        true,
+    );
 }
 
 async fn push_note(state: &Arc<RwLock<DaemonStatus>>, note: String) {
@@ -729,6 +767,54 @@ fn update_share_invite(state: &mut DaemonStatus) {
                 .clone()
                 .filter(|invite| !invite.is_empty())
         });
+}
+
+fn update_known_peer(
+    state: &mut DaemonStatus,
+    peer_id: &str,
+    address: Option<String>,
+    display_name: Option<String>,
+    connected: bool,
+) {
+    if state.network.ignored_peer_ids.iter().any(|id| id == peer_id) {
+        return;
+    }
+
+    let normalized_addr = address.and_then(|addr| shareable_invite(&addr, peer_id));
+
+    let entry = if let Some(existing) = state
+        .network
+        .known_peers
+        .iter_mut()
+        .find(|peer| peer.peer_id == peer_id)
+    {
+        existing
+    } else {
+        state.network.known_peers.push(KnownPeerSummary {
+            peer_id: peer_id.to_string(),
+            display_name: display_name
+                .clone()
+                .unwrap_or_else(|| format!("peer {}", short_peer_id(peer_id))),
+            addresses: Vec::new(),
+            last_dial_addr: None,
+            connected,
+            pinned: false,
+        });
+        state
+            .network
+            .known_peers
+            .last_mut()
+            .expect("known peer inserted")
+    };
+
+    if let Some(name) = display_name {
+        entry.display_name = name;
+    }
+    if let Some(addr) = normalized_addr {
+        insert_unique_addr(&mut entry.addresses, addr.clone());
+        entry.last_dial_addr = Some(addr);
+    }
+    entry.connected = connected;
 }
 
 fn best_share_invite(local_peer_id: &str, network: &voicers_core::NetworkSummary) -> Option<String> {

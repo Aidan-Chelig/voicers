@@ -14,8 +14,8 @@ use ratatui::{
     DefaultTerminal,
 };
 use voicers_core::{
-    ControlRequest, ControlResponse, DaemonStatus, PeerMediaState, PeerSessionState,
-    PeerTransportState, DEFAULT_CONTROL_ADDR,
+    ControlRequest, ControlResponse, DaemonStatus, KnownPeerSummary, PeerMediaState,
+    PeerSessionState, PeerTransportState, DEFAULT_CONTROL_ADDR,
 };
 
 struct UiApp {
@@ -27,9 +27,11 @@ struct UiApp {
     input_mode: InputMode,
     dial_input: String,
     room_input: String,
+    rename_input: String,
     screen: Screen,
     selected_peer: usize,
     selected_config_item: usize,
+    selected_known_peer: usize,
     daemon_launch: DaemonLaunchState,
 }
 
@@ -41,12 +43,15 @@ enum InputMode {
     Dial,
     Room,
     ControlAddr,
+    RenameSelf,
+    RenameKnownPeer,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Main,
     Config,
+    KnownPeers,
 }
 
 enum ConfigItem {
@@ -77,9 +82,11 @@ impl UiApp {
             input_mode: InputMode::Normal,
             dial_input: "/ip4/127.0.0.1/tcp/".to_string(),
             room_input: "dev-room".to_string(),
+            rename_input: String::new(),
             screen: Screen::Main,
             selected_peer: 0,
             selected_config_item: 0,
+            selected_known_peer: 0,
             daemon_launch: DaemonLaunchState::default(),
         }
     }
@@ -94,6 +101,14 @@ impl UiApp {
 
     fn selected_peer(&self) -> Option<&voicers_core::PeerSummary> {
         self.status.as_ref()?.peers.get(self.selected_peer)
+    }
+
+    fn selected_known_peer(&self) -> Option<&KnownPeerSummary> {
+        self.status
+            .as_ref()?
+            .network
+            .known_peers
+            .get(self.selected_known_peer)
     }
 
     fn clamp_selection(&mut self) {
@@ -115,6 +130,19 @@ impl UiApp {
             self.selected_config_item = 0;
         } else if self.selected_config_item >= len {
             self.selected_config_item = len - 1;
+        }
+    }
+
+    fn clamp_known_peer_selection(&mut self) {
+        let len = self
+            .status
+            .as_ref()
+            .map(|status| status.network.known_peers.len())
+            .unwrap_or(0);
+        if len == 0 {
+            self.selected_known_peer = 0;
+        } else if self.selected_known_peer >= len {
+            self.selected_known_peer = len - 1;
         }
     }
 
@@ -202,6 +230,12 @@ async fn run_tui(mut terminal: DefaultTerminal, config: UiConfig) -> Result<()> 
                     InputMode::ControlAddr => {
                         handle_text_input(&mut app, key.code, InputMode::ControlAddr).await
                     }
+                    InputMode::RenameSelf => {
+                        handle_text_input(&mut app, key.code, InputMode::RenameSelf).await
+                    }
+                    InputMode::RenameKnownPeer => {
+                        handle_text_input(&mut app, key.code, InputMode::RenameKnownPeer).await
+                    }
                 }
             }
         }
@@ -214,6 +248,7 @@ async fn handle_key(app: &mut UiApp, key: KeyCode) -> Result<bool> {
     match app.screen {
         Screen::Main => handle_main_screen(app, key).await,
         Screen::Config => handle_config_screen(app, key).await,
+        Screen::KnownPeers => handle_known_peers_screen(app, key).await,
     }
 }
 
@@ -224,6 +259,11 @@ async fn handle_main_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
             app.screen = Screen::Config;
             app.clamp_config_selection();
             app.set_flash(default_flash(Screen::Config));
+        }
+        KeyCode::Char('p') => {
+            app.screen = Screen::KnownPeers;
+            app.clamp_known_peer_selection();
+            app.set_flash(default_flash(Screen::KnownPeers));
         }
         KeyCode::Char('j') | KeyCode::Down => {
             let len = app
@@ -246,6 +286,9 @@ async fn handle_main_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
             app.set_flash(render_message(response));
             refresh_status(app).await;
         }
+        KeyCode::Char('a') => {
+            save_selected_live_peer(app).await;
+        }
         KeyCode::Char('s') => {
             launch_daemon(app, false);
             refresh_status(app).await;
@@ -267,6 +310,18 @@ async fn handle_main_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
             if let Some(saved) = app
                 .status
                 .as_ref()
+                .and_then(|status| status.network.known_peers.first())
+                .and_then(best_known_peer_address)
+                .or_else(|| {
+                    app.status
+                        .as_ref()
+                        .and_then(|status| status.network.saved_peer_addrs.first().cloned())
+                })
+            {
+                app.dial_input = saved;
+            } else if let Some(saved) = app
+                .status
+                .as_ref()
                 .and_then(|status| status.network.saved_peer_addrs.first())
             {
                 app.dial_input = saved.clone();
@@ -285,6 +340,15 @@ async fn handle_main_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
         KeyCode::Char('r') => {
             app.input_mode = InputMode::Room;
             app.set_flash_persistent("enter room name and press Enter");
+        }
+        KeyCode::Char('u') => {
+            app.rename_input = app
+                .status
+                .as_ref()
+                .map(|status| status.session.display_name.clone())
+                .unwrap_or_default();
+            app.input_mode = InputMode::RenameSelf;
+            app.set_flash_persistent("rename yourself and press Enter");
         }
         KeyCode::Tab => {
             app.input_mode = InputMode::ControlAddr;
@@ -306,6 +370,11 @@ async fn handle_config_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
         KeyCode::Char('c') | KeyCode::Esc => {
             app.screen = Screen::Main;
             app.set_flash(default_flash(Screen::Main));
+        }
+        KeyCode::Char('p') => {
+            app.screen = Screen::KnownPeers;
+            app.clamp_known_peer_selection();
+            app.set_flash(default_flash(Screen::KnownPeers));
         }
         KeyCode::Char('s') => {
             launch_daemon(app, false);
@@ -334,6 +403,75 @@ async fn handle_config_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
         KeyCode::Char('g') => {
             refresh_status(app).await;
             app.clamp_config_selection();
+            app.set_flash("status refreshed");
+        }
+        _ => {}
+    }
+
+    Ok(false)
+}
+
+async fn handle_known_peers_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
+    match key {
+        KeyCode::Char('q') => return Ok(true),
+        KeyCode::Char('p') | KeyCode::Esc => {
+            app.screen = Screen::Main;
+            app.set_flash(default_flash(Screen::Main));
+        }
+        KeyCode::Char('u') => {
+            app.rename_input = app
+                .status
+                .as_ref()
+                .map(|status| status.session.display_name.clone())
+                .unwrap_or_default();
+            app.input_mode = InputMode::RenameSelf;
+            app.set_flash_persistent("rename yourself and press Enter");
+        }
+        KeyCode::Char('c') => {
+            app.screen = Screen::Config;
+            app.clamp_config_selection();
+            app.set_flash(default_flash(Screen::Config));
+        }
+        KeyCode::Char('s') => {
+            launch_daemon(app, false);
+            refresh_status(app).await;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            let len = app
+                .status
+                .as_ref()
+                .map(|status| status.network.known_peers.len())
+                .unwrap_or(0);
+            if len > 0 {
+                app.selected_known_peer = (app.selected_known_peer + 1).min(len - 1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if app.selected_known_peer > 0 {
+                app.selected_known_peer -= 1;
+            }
+        }
+        KeyCode::Enter | KeyCode::Char('d') => {
+            reconnect_selected_known_peer(app).await;
+        }
+        KeyCode::Char('a') => {
+            save_selected_known_peer(app).await;
+        }
+        KeyCode::Char('D') => {
+            forget_selected_known_peer(app).await;
+        }
+        KeyCode::Char('n') => {
+            if let Some(peer) = app.selected_known_peer() {
+                app.rename_input = peer.display_name.clone();
+                app.input_mode = InputMode::RenameKnownPeer;
+                app.set_flash_persistent("rename known peer and press Enter");
+            } else {
+                app.set_flash("no known peer selected");
+            }
+        }
+        KeyCode::Char('g') => {
+            refresh_status(app).await;
+            app.clamp_known_peer_selection();
             app.set_flash("status refreshed");
         }
         _ => {}
@@ -377,6 +515,36 @@ async fn handle_text_input(app: &mut UiApp, key: KeyCode, mode: InputMode) {
                 app.input_mode = InputMode::Normal;
                 refresh_status(app).await;
             }
+            InputMode::RenameSelf => {
+                let response = client::send_request_to(
+                    &app.control_addr,
+                    ControlRequest::SetDisplayName {
+                        display_name: app.rename_input.trim().to_string(),
+                    },
+                )
+                .await;
+                app.set_flash(render_message(response));
+                app.input_mode = InputMode::Normal;
+                refresh_status(app).await;
+            }
+            InputMode::RenameKnownPeer => {
+                let Some(peer_id) = app.selected_known_peer().map(|peer| peer.peer_id.clone()) else {
+                    app.set_flash("no known peer selected");
+                    app.input_mode = InputMode::Normal;
+                    return;
+                };
+                let response = client::send_request_to(
+                    &app.control_addr,
+                    ControlRequest::RenameKnownPeer {
+                        peer_id,
+                        display_name: app.rename_input.trim().to_string(),
+                    },
+                )
+                .await;
+                app.set_flash(render_message(response));
+                app.input_mode = InputMode::Normal;
+                refresh_status(app).await;
+            }
             InputMode::Normal => {}
         },
         KeyCode::Backspace => match mode {
@@ -389,12 +557,20 @@ async fn handle_text_input(app: &mut UiApp, key: KeyCode, mode: InputMode) {
             InputMode::ControlAddr => {
                 app.control_addr.pop();
             }
+            InputMode::RenameSelf => {
+                app.rename_input.pop();
+            }
+            InputMode::RenameKnownPeer => {
+                app.rename_input.pop();
+            }
             InputMode::Normal => {}
         },
         KeyCode::Char(ch) => match mode {
             InputMode::Dial => app.dial_input.push(ch),
             InputMode::Room => app.room_input.push(ch),
             InputMode::ControlAddr => app.control_addr.push(ch),
+            InputMode::RenameSelf => app.rename_input.push(ch),
+            InputMode::RenameKnownPeer => app.rename_input.push(ch),
             InputMode::Normal => {}
         },
         _ => {}
@@ -407,6 +583,7 @@ async fn refresh_status(app: &mut UiApp) {
             app.status = Some(status);
             app.clamp_selection();
             app.clamp_config_selection();
+            app.clamp_known_peer_selection();
             app.daemon_launch.attempted_auto_start = true;
         }
         Ok(other) => {
@@ -500,6 +677,77 @@ async fn adjust_selected_config(app: &mut UiApp, delta_percent: i16) {
     }
 }
 
+async fn reconnect_selected_known_peer(app: &mut UiApp) {
+    let peer = app
+        .status
+        .as_ref()
+        .and_then(|status| status.network.known_peers.get(app.selected_known_peer))
+        .cloned();
+
+    let Some(peer) = peer else {
+        app.set_flash("no known peer selected");
+        return;
+    };
+
+    let Some(address) = best_known_peer_address(&peer) else {
+        app.set_flash(format!("{} has no saved dial address", peer.display_name));
+        return;
+    };
+
+    let response = client::send_request_to(
+        &app.control_addr,
+        ControlRequest::JoinPeer { address },
+    )
+    .await;
+    app.set_flash(render_message(response));
+    refresh_status(app).await;
+}
+
+async fn save_selected_known_peer(app: &mut UiApp) {
+    let Some(peer_id) = app.selected_known_peer().map(|peer| peer.peer_id.clone()) else {
+        app.set_flash("no known peer selected");
+        return;
+    };
+
+    let response = client::send_request_to(
+        &app.control_addr,
+        ControlRequest::SaveKnownPeer { peer_id },
+    )
+    .await;
+    app.set_flash(render_message(response));
+    refresh_status(app).await;
+}
+
+async fn save_selected_live_peer(app: &mut UiApp) {
+    let Some(peer_id) = app.selected_peer_id() else {
+        app.set_flash("no live peer selected");
+        return;
+    };
+
+    let response = client::send_request_to(
+        &app.control_addr,
+        ControlRequest::SaveKnownPeer { peer_id },
+    )
+    .await;
+    app.set_flash(render_message(response));
+    refresh_status(app).await;
+}
+
+async fn forget_selected_known_peer(app: &mut UiApp) {
+    let Some(peer_id) = app.selected_known_peer().map(|peer| peer.peer_id.clone()) else {
+        app.set_flash("no known peer selected");
+        return;
+    };
+
+    let response = client::send_request_to(
+        &app.control_addr,
+        ControlRequest::ForgetKnownPeer { peer_id },
+    )
+    .await;
+    app.set_flash(render_message(response));
+    refresh_status(app).await;
+}
+
 fn launch_daemon(app: &mut UiApp, auto: bool) -> bool {
     if auto && app.daemon_launch.attempted_auto_start {
         return false;
@@ -559,10 +807,13 @@ fn render_message(response: Result<ControlResponse>) -> String {
 fn default_flash(screen: Screen) -> &'static str {
     match screen {
         Screen::Main => {
-            "q quit | c config | tab control addr | s start daemon | r room | d dial | i invite | m mute self | x mute peer | j/k or arrows move"
+            "q quit | c config | p peers | n rename self | a save peer | tab control addr | s start daemon | r room | d dial | i invite | m mute self | x mute peer | j/k or arrows move"
         }
         Screen::Config => {
-            "q quit | c back | s start daemon | enter select device | hjkl or arrows navigate"
+            "q quit | c back | p peers | n rename self | s start daemon | enter select device | hjkl or arrows navigate"
+        }
+        Screen::KnownPeers => {
+            "q quit | p back | c config | u rename self | a save | n rename peer | D forget | enter or d reconnect | j/k or arrows move"
         }
     }
 }
@@ -570,6 +821,12 @@ fn default_flash(screen: Screen) -> &'static str {
 fn adjust_percent(current: u8, delta: i16) -> u8 {
     let next = i16::from(current) + delta;
     next.clamp(0, 200) as u8
+}
+
+fn best_known_peer_address(peer: &KnownPeerSummary) -> Option<String> {
+    peer.last_dial_addr
+        .clone()
+        .or_else(|| peer.addresses.first().cloned())
 }
 
 fn draw(frame: &mut Frame, app: &UiApp) {
@@ -601,6 +858,12 @@ fn draw(frame: &mut Frame, app: &UiApp) {
                 Layout::horizontal([Constraint::Length(60), Constraint::Min(28)]).split(root[1]);
             draw_config_screen(frame, app, middle[0]);
             draw_notes(frame, app, middle[1]);
+        }
+        Screen::KnownPeers => {
+            let middle =
+                Layout::horizontal([Constraint::Length(52), Constraint::Min(36)]).split(root[1]);
+            draw_known_peers_screen(frame, app, middle[0]);
+            draw_known_peer_details(frame, app, middle[1]);
         }
     }
     draw_footer(frame, app, root[2]);
@@ -1074,6 +1337,179 @@ fn draw_config_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+fn draw_known_peers_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
+    let items = if let Some(status) = &app.status {
+        if status.network.known_peers.is_empty() {
+            vec![ListItem::new(Span::styled(
+                "No known peers yet",
+                Style::default().fg(color_muted()),
+            ))]
+        } else {
+            status
+                .network
+                .known_peers
+                .iter()
+                .map(|peer| {
+                    ListItem::new(vec![
+                        Line::from(vec![
+                            Span::styled(
+                                peer.display_name.clone(),
+                                Style::default()
+                                    .fg(color_text())
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(" "),
+                            if peer.pinned {
+                                badge("saved", color_accent(), color_bg())
+                            } else {
+                                badge("learned", color_panel_alt(), color_bg())
+                            },
+                            Span::raw(" "),
+                            badge(
+                                if peer.connected { "online" } else { "saved" },
+                                if peer.connected {
+                                    color_good()
+                                } else {
+                                    color_panel_alt()
+                                },
+                                color_bg(),
+                            ),
+                        ]),
+                        Line::from(vec![
+                            Span::styled(
+                                format!("@{}", short_id(&peer.peer_id)),
+                                Style::default().fg(color_muted()),
+                            ),
+                            Span::raw("  "),
+                            Span::styled(
+                                peer.last_dial_addr
+                                    .clone()
+                                    .unwrap_or_else(|| "<no saved dial addr>".to_string()),
+                                Style::default().fg(color_subtle()),
+                            ),
+                        ]),
+                    ])
+                })
+                .collect()
+        }
+    } else {
+        vec![ListItem::new(Span::styled(
+            "Daemon unavailable",
+            Style::default().fg(color_warn()),
+        ))]
+    };
+
+    let mut state = ListState::default();
+    if app
+        .status
+        .as_ref()
+        .map(|status| !status.network.known_peers.is_empty())
+        .unwrap_or(false)
+    {
+        state.select(Some(app.selected_known_peer.min(items.len() - 1)));
+    }
+
+    let list = List::new(items)
+        .block(panel_block("Known Peers", color_panel_alt()))
+        .highlight_style(
+            Style::default()
+                .bg(color_selected())
+                .fg(color_text())
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(" > ");
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_known_peer_details(frame: &mut Frame, app: &UiApp, area: Rect) {
+    let lines = app
+        .status
+        .as_ref()
+        .and_then(|status| status.network.known_peers.get(app.selected_known_peer))
+        .map(known_peer_lines)
+        .unwrap_or_else(|| {
+            vec![Line::from(Span::styled(
+                "Select a known peer to inspect saved addresses",
+                Style::default().fg(color_muted()),
+            ))]
+        });
+
+    let widget = Paragraph::new(lines)
+        .block(panel_block("Peer Record", color_panel_alt()))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(widget, area);
+}
+
+fn known_peer_lines(peer: &KnownPeerSummary) -> Vec<Line<'static>> {
+    let addresses = if peer.addresses.is_empty() {
+        vec![Line::from(Span::styled(
+            "<no saved addresses>",
+            Style::default().fg(color_muted()),
+        ))]
+    } else {
+        peer.addresses
+            .iter()
+            .map(|addr| Line::from(Span::styled(addr.clone(), Style::default().fg(color_subtle()))))
+            .collect()
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                peer.display_name.clone(),
+                Style::default()
+                    .fg(color_text())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            badge(
+                if peer.connected { "connected" } else { "offline" },
+                if peer.connected {
+                    color_good()
+                } else {
+                    color_warn()
+                },
+                color_bg(),
+            ),
+            Span::raw("  "),
+            badge(
+                if peer.pinned { "pinned" } else { "learned" },
+                if peer.pinned {
+                    color_accent()
+                } else {
+                    color_panel_alt()
+                },
+                color_bg(),
+            ),
+        ]),
+        Line::from(vec![
+            label("PEER"),
+            Span::raw(" "),
+            Span::styled(peer.peer_id.clone(), Style::default().fg(color_muted())),
+        ]),
+        Line::from(vec![
+            label("DIAL"),
+            Span::raw(" "),
+            Span::styled(
+                peer.last_dial_addr
+                    .clone()
+                    .unwrap_or_else(|| "<none>".to_string()),
+                Style::default().fg(color_text()),
+            ),
+        ]),
+        Line::from(vec![
+            label("ADDRS"),
+            Span::raw(" "),
+            Span::styled(
+                format!("{}", peer.addresses.len()),
+                Style::default().fg(color_text()),
+            ),
+        ]),
+    ];
+    lines.extend(addresses);
+    lines
+}
+
 fn draw_notes(frame: &mut Frame, app: &UiApp, area: Rect) {
     let lines = app
         .status
@@ -1110,6 +1546,8 @@ fn draw_input_popup(frame: &mut Frame, app: &UiApp) {
         InputMode::Dial => ("Dial Peer", app.dial_input.as_str()),
         InputMode::Room => ("Create Room", app.room_input.as_str()),
         InputMode::ControlAddr => ("Control Address", app.control_addr.as_str()),
+        InputMode::RenameSelf => ("Rename Yourself", app.rename_input.as_str()),
+        InputMode::RenameKnownPeer => ("Rename Peer", app.rename_input.as_str()),
         InputMode::Normal => return,
     };
 
