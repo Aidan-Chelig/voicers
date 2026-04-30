@@ -1,17 +1,31 @@
-[package]
-name = "voice"
+[workspace]
+members = [
+    "crates/voicers",
+    "crates/voicers-core",
+    "crates/voicersd",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.83"
 version = "0.1.0"
-authors = ["Aidan Chelig <aidan.chelig@gmail.com>"]
-edition = "2018"
+license = "MIT"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[workspace.dependencies]
+anyhow = "1.0.102"
+audiopus = "0.3.0-rc.0"
+audiopus_sys = { version = "0.2.2", features = ["static"] }
+cpal = "0.15.3"
+crossterm = "0.29.0"
+futures = "0.3.32"
+libp2p = { version = "0.56.0", features = ["cbor", "ed25519", "identify", "macros", "noise", "ping", "request-response", "tcp", "tokio", "upnp", "yamux"] }
+pipewire = "0.9.2"
+ratatui = "0.30.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.52.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.18", features = ["codec"] }
 
-[dependencies]
-
-cpal = "0.11.0"
-anyhow = "1.0.26"
-hound = "3.4.0"
-tokio = { version = "0.2", features = ["full"] }
-futures = "0.3.0"
-tokio-util = { version = "0.2.0", features = ["full"] }
-audiopus = "0.2"
+[patch.crates-io]
+audiopus_sys = { path = "vendor" }
