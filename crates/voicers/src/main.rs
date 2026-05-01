@@ -18,15 +18,18 @@ use ratatui::{
 use ui::{
     model::{
         adjust_percent, best_known_peer_address, default_flash, local_fallback_test_steps,
-        parse_ui_config, ranked_fallback_candidates, short_id, ConfigItem, InputMode, Screen,
-        UiApp, UiConfig,
+        parse_ui_config, ranked_fallback_candidates, short_id, visible_voice_peers, ConfigItem,
+        InputMode, Screen, UiApp, UiConfig,
     },
     theme::{
         badge, color_accent, color_bg, color_good, color_muted, color_panel_alt, color_selected,
         color_subtle, color_text, color_warn, label, panel_block, transport_color, transport_label,
     },
 };
-use voicers_core::{ControlRequest, ControlResponse, KnownPeerSummary, DEFAULT_CONTROL_ADDR};
+use voicers_core::{
+    encode_join_namespace_invite, ControlRequest, ControlResponse, KnownPeerSummary,
+    DEFAULT_CONTROL_ADDR,
+};
 
 const DEFAULT_ROOM_NAME: &str = "main";
 
@@ -118,7 +121,7 @@ async fn handle_main_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
             let len = app
                 .status
                 .as_ref()
-                .map(|status| status.peers.len())
+                .map(|status| visible_voice_peers(status).len())
                 .unwrap_or(0);
             if len > 0 {
                 app.selected_peer = (app.selected_peer + 1).min(len - 1);
@@ -186,7 +189,7 @@ async fn handle_main_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
             let invite = app
                 .status
                 .as_ref()
-                .and_then(|status| status.network.share_invite.clone())
+                .and_then(preferred_clipboard_invite)
                 .unwrap_or_else(|| "no shareable invite yet".to_string());
             match copy_to_clipboard(&invite) {
                 Ok(()) => app.set_flash("invite copied to clipboard"),
@@ -820,6 +823,16 @@ fn render_message(response: Result<ControlResponse>) -> String {
     }
 }
 
+fn preferred_clipboard_invite(status: &voicers_core::DaemonStatus) -> Option<String> {
+    status
+        .session
+        .invite_code
+        .as_deref()
+        .filter(|code| !code.trim().is_empty())
+        .map(encode_join_namespace_invite)
+        .or_else(|| status.network.share_invite.clone())
+}
+
 fn draw(frame: &mut Frame, app: &UiApp) {
     frame.render_widget(
         Block::default().style(Style::default().bg(color_bg()).fg(color_text())),
@@ -1212,15 +1225,15 @@ fn draw_home_panel(frame: &mut Frame, app: &UiApp, area: Rect) {
 
 fn draw_peer_list(frame: &mut Frame, app: &UiApp, area: Rect) {
     let items = if let Some(status) = &app.status {
-        if status.peers.is_empty() {
+        let visible_peers = visible_voice_peers(status);
+        if visible_peers.is_empty() {
             vec![ListItem::new(Line::from(Span::styled(
                 "No peers connected",
                 Style::default().fg(color_muted()),
             )))]
         } else {
-            status
-                .peers
-                .iter()
+            visible_peers
+                .into_iter()
                 .map(|peer| {
                     ListItem::new(vec![
                         Line::from(vec![
@@ -1277,7 +1290,7 @@ fn draw_peer_list(frame: &mut Frame, app: &UiApp, area: Rect) {
     if app
         .status
         .as_ref()
-        .map(|status| !status.peers.is_empty())
+        .map(|status| !visible_voice_peers(status).is_empty())
         .unwrap_or(false)
     {
         state.select(Some(app.selected_peer));

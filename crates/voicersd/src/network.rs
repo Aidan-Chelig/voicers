@@ -12,9 +12,9 @@ use std::{
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::{
-    dcutr, identify, kad, kad::store::MemoryStore, multiaddr::Protocol, noise, ping, relay,
-    request_response, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, upnp, yamux, Multiaddr,
-    PeerId, StreamProtocol, SwarmBuilder,
+    connection_limits, dcutr, identify, kad, kad::store::MemoryStore, multiaddr::Protocol,
+    noise, ping, relay, request_response, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, tls,
+    upnp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
 };
 use serde_json;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -45,13 +45,14 @@ const PROTOCOL_VERSION: &str = "/voicers/0.1.0";
 const SESSION_PROTOCOL: StreamProtocol = StreamProtocol::new("/voicers/session/0.1.0");
 const MEDIA_PROTOCOL: StreamProtocol = StreamProtocol::new("/voicers/media/0.1.0");
 const MAX_AUTO_RELAY_CANDIDATES: usize = 4;
+const MAX_ESTABLISHED_CONNECTIONS: u32 = 32;
+const MAX_ESTABLISHED_OUTGOING_CONNECTIONS: u32 = 24;
+const MAX_ESTABLISHED_INCOMING_CONNECTIONS: u32 = 12;
+const MAX_PENDING_OUTGOING_CONNECTIONS: u32 = 16;
+const MAX_PENDING_INCOMING_CONNECTIONS: u32 = 8;
 const RENDEZVOUS_RECORD_PREFIX: &str = "/voicers/rendezvous/v1/";
 const DEFAULT_ROOM_NAMESPACE: &str = "main";
 const DEFAULT_BOOTSTRAP_ADDRS: &[&str] = &[
-    "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-    "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-    "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
-    "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
     "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 ];
 const DEFAULT_STUN_SERVERS: &[&str] = &[
@@ -248,6 +249,7 @@ enum NetworkCommand {
 
 #[derive(NetworkBehaviour)]
 struct VoicersBehaviour {
+    limits: connection_limits::Behaviour,
     relay: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
     kad: kad::Behaviour<MemoryStore>,
@@ -258,7 +260,7 @@ struct VoicersBehaviour {
     media: request_response::cbor::Behaviour<MediaRequest, MediaResponse>,
 }
 
-pub fn start(
+pub async fn start(
     state: Arc<RwLock<DaemonStatus>>,
     listen_addr: &str,
     relay_addr: Option<&str>,
@@ -284,12 +286,30 @@ pub fn start(
             noise::Config::new,
             yamux::Config::default,
         )?
+        .with_quic()
         .with_dns()?
+        .with_websocket(
+            (tls::Config::new, noise::Config::new),
+            yamux::Config::default,
+        )
+        .await?
         .with_relay_client(noise::Config::new, yamux::Config::default)?
         .with_behaviour(|key, relay| {
             let local_peer_id = key.public().to_peer_id();
             let store = MemoryStore::new(local_peer_id);
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(VoicersBehaviour {
+                limits: connection_limits::Behaviour::new(
+                    connection_limits::ConnectionLimits::default()
+                        .with_max_established(Some(MAX_ESTABLISHED_CONNECTIONS))
+                        .with_max_established_outgoing(Some(
+                            MAX_ESTABLISHED_OUTGOING_CONNECTIONS,
+                        ))
+                        .with_max_established_incoming(Some(
+                            MAX_ESTABLISHED_INCOMING_CONNECTIONS,
+                        ))
+                        .with_max_pending_outgoing(Some(MAX_PENDING_OUTGOING_CONNECTIONS))
+                        .with_max_pending_incoming(Some(MAX_PENDING_INCOMING_CONNECTIONS)),
+                ),
                 relay,
                 dcutr: dcutr::Behaviour::new(local_peer_id),
                 kad: kad::Behaviour::new(local_peer_id, store),
@@ -348,6 +368,12 @@ pub fn start(
             .and_then(split_peer_addr)
         {
             Ok((peer_id, peer_addr)) => {
+                if !is_supported_dial_addr(&peer_addr) {
+                    eprintln!(
+                        "ignoring unsupported bootstrap address {bootstrap_addr}: transport not supported by voicersd"
+                    );
+                    continue;
+                }
                 swarm.behaviour_mut().kad.add_address(&peer_id, peer_addr);
                 configured_bootstrap_peers += 1;
             }
@@ -408,6 +434,8 @@ async fn run_network_task(
 ) {
     let mut active_media_flows = HashSet::new();
     let mut attempted_relays = HashSet::new();
+    let mut connected_peers = HashSet::new();
+    let mut dht_routable_peers = HashSet::new();
     let mut pending_dials = HashMap::new();
     let mut pending_rendezvous_lookups = HashMap::new();
     let mut pending_rendezvous_publications = HashMap::new();
@@ -422,6 +450,8 @@ async fn run_network_task(
                     &mut swarm,
                     &command_tx,
                     &mut active_media_flows,
+                    &connected_peers,
+                    &dht_routable_peers,
                     &mut pending_dials,
                     &mut pending_rendezvous_lookups,
                     &mut pending_rendezvous_publications,
@@ -437,6 +467,8 @@ async fn run_network_task(
                     &mut swarm,
                     &command_tx,
                     &mut active_media_flows,
+                    &mut connected_peers,
+                    &mut dht_routable_peers,
                     &mut attempted_relays,
                     &mut pending_dials,
                     &mut pending_rendezvous_lookups,
@@ -467,6 +499,8 @@ async fn run_network_task(
 ) {
     let mut active_media_flows = HashSet::new();
     let mut attempted_relays = HashSet::new();
+    let mut connected_peers = HashSet::new();
+    let mut dht_routable_peers = HashSet::new();
     let mut pending_dials = HashMap::new();
     let mut pending_rendezvous_lookups = HashMap::new();
     let mut pending_rendezvous_publications = HashMap::new();
@@ -481,6 +515,8 @@ async fn run_network_task(
                     &mut swarm,
                     &command_tx,
                     &mut active_media_flows,
+                    &connected_peers,
+                    &dht_routable_peers,
                     &mut pending_dials,
                     &mut pending_rendezvous_lookups,
                     &mut pending_rendezvous_publications,
@@ -512,6 +548,8 @@ async fn run_network_task(
                     &mut swarm,
                     &command_tx,
                     &mut active_media_flows,
+                    &mut connected_peers,
+                    &mut dht_routable_peers,
                     &mut attempted_relays,
                     &mut pending_dials,
                     &mut pending_rendezvous_lookups,
@@ -533,6 +571,8 @@ async fn handle_command(
     swarm: &mut libp2p::Swarm<VoicersBehaviour>,
     command_tx: &mpsc::Sender<NetworkCommand>,
     active_media_flows: &mut HashSet<String>,
+    connected_peers: &HashSet<PeerId>,
+    dht_routable_peers: &HashSet<PeerId>,
     pending_dials: &mut HashMap<String, PendingDial>,
     pending_rendezvous_lookups: &mut HashMap<kad::QueryId, PendingRendezvousLookup>,
     pending_rendezvous_publications: &mut HashMap<kad::QueryId, (String, Vec<u8>)>,
@@ -562,6 +602,8 @@ async fn handle_command(
             maybe_publish_rendezvous_record(
                 state,
                 swarm,
+                connected_peers,
+                dht_routable_peers,
                 pending_rendezvous_publications,
                 published_rendezvous_records,
             )
@@ -744,6 +786,8 @@ async fn handle_swarm_event(
     swarm: &mut libp2p::Swarm<VoicersBehaviour>,
     command_tx: &mpsc::Sender<NetworkCommand>,
     active_media_flows: &mut HashSet<String>,
+    connected_peers: &mut HashSet<PeerId>,
+    dht_routable_peers: &mut HashSet<PeerId>,
     attempted_relays: &mut HashSet<PeerId>,
     pending_dials: &mut HashMap<String, PendingDial>,
     pending_rendezvous_lookups: &mut HashMap<kad::QueryId, PendingRendezvousLookup>,
@@ -774,6 +818,8 @@ async fn handle_swarm_event(
             maybe_publish_rendezvous_record(
                 state,
                 swarm,
+                connected_peers,
+                dht_routable_peers,
                 pending_rendezvous_publications,
                 published_rendezvous_records,
             )
@@ -792,6 +838,8 @@ async fn handle_swarm_event(
             maybe_publish_rendezvous_record(
                 state,
                 swarm,
+                connected_peers,
+                dht_routable_peers,
                 pending_rendezvous_publications,
                 published_rendezvous_records,
             )
@@ -813,6 +861,8 @@ async fn handle_swarm_event(
             maybe_publish_rendezvous_record(
                 state,
                 swarm,
+                connected_peers,
+                dht_routable_peers,
                 pending_rendezvous_publications,
                 published_rendezvous_records,
             )
@@ -831,6 +881,8 @@ async fn handle_swarm_event(
             maybe_publish_rendezvous_record(
                 state,
                 swarm,
+                connected_peers,
+                dht_routable_peers,
                 pending_rendezvous_publications,
                 published_rendezvous_records,
             )
@@ -840,7 +892,9 @@ async fn handle_swarm_event(
         SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
         } => {
-            pending_dials.remove(&peer_id.to_string());
+            connected_peers.insert(peer_id);
+            let peer_id_string = peer_id.to_string();
+            let had_pending_dial = pending_dials.remove(&peer_id_string).is_some();
             let address = endpoint.get_remote_address().to_string();
             let local_hello = {
                 let state = state.read().await;
@@ -849,8 +903,10 @@ async fn handle_swarm_event(
                     display_name: state.session.display_name.clone(),
                 }
             };
-
-            let peer = upsert_peer(state, peer_id.to_string(), address).await;
+            let should_surface_peer = {
+                let state = state.read().await;
+                should_surface_connected_peer(&state, &peer_id_string, had_pending_dial)
+            };
             {
                 let mut state = state.write().await;
                 let path = if endpoint.is_relayed() {
@@ -858,29 +914,39 @@ async fn handle_swarm_event(
                 } else {
                     "libp2p-direct"
                 };
-                record_path_score(&mut state, path, Some(peer.peer_id.clone()), true);
+                record_path_score(&mut state, path, Some(peer_id_string.clone()), true);
             }
             persist_network_snapshot(state, persistence).await;
-            let _ = media.register_peer(peer.peer_id.clone()).await;
             push_note(
                 state,
                 format!(
-                    "{} connection established with {}",
+                    "{} connection established with {}{}",
                     if endpoint.is_relayed() {
                         "relayed"
                     } else {
                         "direct"
                     },
-                    peer.peer_id
+                    peer_id_string,
+                    if should_surface_peer {
+                        ""
+                    } else {
+                        " (transport-only)"
+                    }
                 ),
             )
             .await;
-            let should_send_hello = match &endpoint {
-                libp2p::core::ConnectedPoint::Dialer { .. } => true,
-                libp2p::core::ConnectedPoint::Listener { .. } => is_peer_whitelisted(state, &peer.peer_id).await,
-            };
-            if should_send_hello {
-                send_session_hello(swarm, &peer.peer_id, local_hello).await;
+            if should_surface_peer {
+                let peer = upsert_peer(state, peer_id_string.clone(), address).await;
+                let _ = media.register_peer(peer.peer_id.clone()).await;
+                let should_send_hello = match &endpoint {
+                    libp2p::core::ConnectedPoint::Dialer { .. } => true,
+                    libp2p::core::ConnectedPoint::Listener { .. } => {
+                        is_peer_whitelisted(state, &peer.peer_id).await
+                    }
+                };
+                if should_send_hello {
+                    send_session_hello(swarm, &peer.peer_id, local_hello).await;
+                }
             }
         }
         SwarmEvent::ConnectionClosed {
@@ -888,18 +954,37 @@ async fn handle_swarm_event(
             num_established,
             ..
         } => {
+            if num_established == 0 {
+                connected_peers.remove(&peer_id);
+            }
             {
                 let mut state = state.write().await;
-                if let Some(peer) = state
+                if let Some(index) = state
                     .peers
-                    .iter_mut()
-                    .find(|existing| existing.peer_id == peer_id.to_string())
+                    .iter()
+                    .position(|existing| existing.peer_id == peer_id.to_string())
                 {
-                    peer.transport = if num_established == 0 {
-                        PeerTransportState::Disconnected
+                    let remove_peer = num_established == 0
+                        && matches!(state.peers[index].session, PeerSessionState::None)
+                        && !state
+                            .network
+                            .known_peers
+                            .iter()
+                            .any(|existing| existing.peer_id == peer_id.to_string())
+                        && !state
+                            .pending_peer_approvals
+                            .iter()
+                            .any(|pending| pending.peer_id == peer_id.to_string());
+                    if remove_peer {
+                        state.peers.remove(index);
                     } else {
-                        PeerTransportState::Connected
-                    };
+                        let peer = &mut state.peers[index];
+                        peer.transport = if num_established == 0 {
+                            PeerTransportState::Disconnected
+                        } else {
+                            PeerTransportState::Connected
+                        };
+                    }
                 }
                 if let Some(known_peer) = state
                     .network
@@ -998,10 +1083,12 @@ async fn handle_swarm_event(
             let observed_addr = info.observed_addr.to_string();
 
             for address in &listen_addrs {
-                swarm
-                    .behaviour_mut()
-                    .kad
-                    .add_address(&peer_id, address.clone());
+                if is_supported_dial_addr(address) {
+                    swarm
+                        .behaviour_mut()
+                        .kad
+                        .add_address(&peer_id, address.clone());
+                }
             }
 
             if protocols.contains(&relay::HOP_PROTOCOL_NAME)
@@ -1042,33 +1129,41 @@ async fn handle_swarm_event(
 
             {
                 let mut state = state.write().await;
-                let identified_peer = {
-                    let peer = get_or_insert_peer(&mut state, peer_id.to_string(), remote_addr);
-                    peer.display_name = if agent_version.is_empty() {
-                        format!("peer {}", short_peer_id(&peer.peer_id))
-                    } else {
-                        agent_version
+                if should_surface_peer_metadata(&state, &peer_id.to_string()) {
+                    let identified_peer = {
+                        let peer =
+                            get_or_insert_peer(&mut state, peer_id.to_string(), remote_addr);
+                        peer.display_name = if agent_version.is_empty() {
+                            format!("peer {}", short_peer_id(&peer.peer_id))
+                        } else {
+                            agent_version
+                        };
+                        peer.transport = PeerTransportState::Connected;
+                        (peer.peer_id.clone(), peer.display_name.clone())
                     };
-                    peer.transport = PeerTransportState::Connected;
-                    (peer.peer_id.clone(), peer.display_name.clone())
-                };
-                update_known_peer(
-                    &mut state,
-                    &identified_peer.0,
-                    None,
-                    Some(identified_peer.1.clone()),
-                    true,
-                );
+                    update_known_peer(
+                        &mut state,
+                        &identified_peer.0,
+                        None,
+                        Some(identified_peer.1.clone()),
+                        true,
+                    );
+                    insert_unique_note(
+                        &mut state,
+                        format!("identified session peer {}", identified_peer.0),
+                    );
+                }
                 if !observed_addr.is_empty() {
                     insert_unique_addr(&mut state.network.observed_addrs, observed_addr.clone());
                     state.network.nat_status = "observed by remote peers".to_string();
                 }
                 update_share_invite(&mut state);
-                insert_unique_note(&mut state, format!("identified peer {}", identified_peer.0));
             }
             maybe_publish_rendezvous_record(
                 state,
                 swarm,
+                connected_peers,
+                dht_routable_peers,
                 pending_rendezvous_publications,
                 published_rendezvous_records,
             )
@@ -1157,11 +1252,14 @@ async fn handle_swarm_event(
             kad::Event::RoutingUpdated {
                 peer, is_new_peer, ..
             } => {
+                dht_routable_peers.insert(peer);
                 if is_new_peer {
                     push_note(state, format!("DHT discovered peer {peer}")).await;
                     maybe_publish_rendezvous_record(
                         state,
                         swarm,
+                        connected_peers,
+                        dht_routable_peers,
                         pending_rendezvous_publications,
                         published_rendezvous_records,
                     )
@@ -1184,6 +1282,8 @@ async fn handle_swarm_event(
                     maybe_publish_rendezvous_record(
                         state,
                         swarm,
+                        connected_peers,
+                        dht_routable_peers,
                         pending_rendezvous_publications,
                         published_rendezvous_records,
                     )
@@ -1386,6 +1486,8 @@ async fn handle_swarm_event(
             maybe_publish_rendezvous_record(
                 state,
                 swarm,
+                connected_peers,
+                dht_routable_peers,
                 pending_rendezvous_publications,
                 published_rendezvous_records,
             )
@@ -1408,6 +1510,8 @@ async fn handle_swarm_event(
             maybe_publish_rendezvous_record(
                 state,
                 swarm,
+                connected_peers,
+                dht_routable_peers,
                 pending_rendezvous_publications,
                 published_rendezvous_records,
             )
@@ -1957,6 +2061,27 @@ async fn apply_session_hello(
     );
 }
 
+fn should_surface_connected_peer(
+    state: &DaemonStatus,
+    peer_id: &str,
+    had_pending_dial: bool,
+) -> bool {
+    had_pending_dial || should_surface_peer_metadata(state, peer_id)
+}
+
+fn should_surface_peer_metadata(state: &DaemonStatus, peer_id: &str) -> bool {
+    state.peers.iter().any(|peer| peer.peer_id == peer_id)
+        || state
+            .network
+            .known_peers
+            .iter()
+            .any(|peer| peer.peer_id == peer_id)
+        || state
+            .pending_peer_approvals
+            .iter()
+            .any(|pending| pending.peer_id == peer_id)
+}
+
 async fn record_webrtc_signal(
     state: &Arc<RwLock<DaemonStatus>>,
     peer_id: &PeerId,
@@ -2121,9 +2246,15 @@ fn decode_rendezvous_record(payload: &[u8]) -> Option<CompactInviteV1> {
 async fn maybe_publish_rendezvous_record(
     state: &Arc<RwLock<DaemonStatus>>,
     swarm: &mut libp2p::Swarm<VoicersBehaviour>,
+    connected_peers: &HashSet<PeerId>,
+    dht_routable_peers: &HashSet<PeerId>,
     pending_rendezvous_publications: &mut HashMap<kad::QueryId, (String, Vec<u8>)>,
     published_rendezvous_records: &mut HashMap<String, Vec<u8>>,
 ) {
+    if !has_active_dht_peer(connected_peers, dht_routable_peers) {
+        return;
+    }
+
     let state_snapshot = state.read().await;
     let records = current_rendezvous_records(&state_snapshot);
     drop(state_snapshot);
@@ -2162,6 +2293,15 @@ async fn maybe_publish_rendezvous_record(
             }
         }
     }
+}
+
+fn has_active_dht_peer(
+    connected_peers: &HashSet<PeerId>,
+    dht_routable_peers: &HashSet<PeerId>,
+) -> bool {
+    connected_peers
+        .iter()
+        .any(|peer| dht_routable_peers.contains(peer))
 }
 
 async fn seed_rendezvous_invite(state: &Arc<RwLock<DaemonStatus>>, invite: &CompactInviteV1) {
@@ -2336,6 +2476,10 @@ fn shareable_address(address: &str, local_peer_id: &str) -> Option<String> {
 
 fn is_shareable_multiaddr(address: &Multiaddr) -> bool {
     let allow_loopback = env::var_os("VOICERS_ALLOW_LOOPBACK_INVITES").is_some();
+    if !is_supported_dial_addr(address) {
+        return false;
+    }
+
     for protocol in address.iter() {
         match protocol {
             Protocol::Ip4(ip) => {
@@ -2360,6 +2504,56 @@ fn is_shareable_multiaddr(address: &Multiaddr) -> bool {
     false
 }
 
+fn is_supported_dial_addr(address: &Multiaddr) -> bool {
+    let mut has_host = false;
+    let mut has_tcp = false;
+    let mut has_udp = false;
+    let mut has_quic = false;
+    let mut has_websocket = false;
+
+    for protocol in address.iter() {
+        match protocol {
+            Protocol::Ip4(_) | Protocol::Ip6(_) | Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) => {
+                has_host = true;
+            }
+            Protocol::Tcp(_) => {
+                has_tcp = true;
+            }
+            Protocol::Udp(_) => {
+                has_udp = true;
+            }
+            Protocol::Quic | Protocol::QuicV1 => {
+                has_quic = true;
+            }
+            Protocol::Ws(_) | Protocol::Wss(_) => {
+                has_websocket = true;
+            }
+            Protocol::Dnsaddr(_)
+            | Protocol::Http
+            | Protocol::Https
+            | Protocol::P2pWebRtcDirect
+            | Protocol::P2pWebRtcStar
+            | Protocol::WebRTCDirect
+            | Protocol::P2pWebSocketStar
+            | Protocol::Memory(_)
+            | Protocol::Onion(_, _)
+            | Protocol::Onion3(_)
+            | Protocol::Sctp(_)
+            | Protocol::Udt
+            | Protocol::Unix(_)
+            | Protocol::Utp
+            | Protocol::WebTransport
+            | Protocol::P2pStardust
+            | Protocol::WebRTC => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+
+    has_host && ((has_tcp && !has_quic) || (has_tcp && has_websocket) || (has_udp && has_quic))
+}
+
 fn is_relayed_addr(address: &Multiaddr) -> bool {
     address
         .iter()
@@ -2380,8 +2574,15 @@ fn short_peer_id(peer_id: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_shareable_multiaddr, shareable_address};
+    use super::{
+        is_shareable_multiaddr, is_supported_dial_addr, shareable_address,
+        should_surface_connected_peer,
+    };
     use libp2p::Multiaddr;
+    use voicers_core::{
+        AudioBackend, AudioEngineStage, AudioSummary, DaemonStatus, NetworkSummary,
+        OutputStrategy, PeerSummary, PendingPeerApprovalSummary, SessionSummary,
+    };
 
     #[test]
     fn loopback_addresses_are_not_shareable() {
@@ -2398,5 +2599,124 @@ mod tests {
             shareable_address("/ip4/192.168.1.50/tcp/27015", "peer-id").as_deref(),
             Some("/ip4/192.168.1.50/tcp/27015/p2p/peer-id")
         );
+    }
+
+    #[test]
+    fn unsupported_and_supported_transports_are_classified_correctly() {
+        let dnsaddr: Multiaddr =
+            "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
+                .parse()
+                .unwrap();
+        let quic: Multiaddr = "/ip4/203.0.113.10/udp/4001/quic-v1".parse().unwrap();
+        let wss: Multiaddr = "/dns4/example.net/tcp/443/wss".parse().unwrap();
+
+        assert!(!is_supported_dial_addr(&dnsaddr));
+        assert!(is_supported_dial_addr(&quic));
+        assert!(is_supported_dial_addr(&wss));
+        assert!(!is_shareable_multiaddr(&dnsaddr));
+        assert!(is_shareable_multiaddr(&quic));
+        assert!(is_shareable_multiaddr(&wss));
+    }
+
+    #[test]
+    fn only_explicit_or_session_peers_are_surfaced_as_people() {
+        let empty = test_status(Vec::new(), Vec::new(), Vec::new());
+        assert!(!should_surface_connected_peer(
+            &empty,
+            "12D3KooWBootstrapPeer",
+            false
+        ));
+        assert!(should_surface_connected_peer(
+            &empty,
+            "12D3KooWDialedPeer",
+            true
+        ));
+
+        let known = test_status(
+            Vec::new(),
+            vec![voicers_core::KnownPeerSummary {
+                peer_id: "12D3KooWFriend".to_string(),
+                display_name: "Friend".to_string(),
+                addresses: Vec::new(),
+                last_dial_addr: None,
+                connected: false,
+                pinned: false,
+                whitelisted: false,
+            }],
+            Vec::new(),
+        );
+        assert!(should_surface_connected_peer(
+            &known,
+            "12D3KooWFriend",
+            false
+        ));
+
+        let pending = test_status(
+            Vec::new(),
+            Vec::new(),
+            vec![PendingPeerApprovalSummary {
+                peer_id: "12D3KooWPending".to_string(),
+                display_name: "Pending".to_string(),
+                address: "<unknown>".to_string(),
+                room_name: Some("room".to_string()),
+                known: false,
+            }],
+        );
+        assert!(should_surface_connected_peer(
+            &pending,
+            "12D3KooWPending",
+            false
+        ));
+    }
+
+    fn test_status(
+        peers: Vec<PeerSummary>,
+        known_peers: Vec<voicers_core::KnownPeerSummary>,
+        pending_peer_approvals: Vec<PendingPeerApprovalSummary>,
+    ) -> DaemonStatus {
+        DaemonStatus {
+            daemon_version: "test".to_string(),
+            control_addr: "127.0.0.1:7767".to_string(),
+            local_peer_id: "local".to_string(),
+            session: SessionSummary {
+                room_name: None,
+                display_name: "local".to_string(),
+                self_muted: false,
+                invite_code: None,
+                invite_expires_at_ms: None,
+            },
+            network: NetworkSummary {
+                implementation: "libp2p".to_string(),
+                transport_stage: String::new(),
+                nat_status: String::new(),
+                listen_addrs: Vec::new(),
+                external_addrs: Vec::new(),
+                observed_addrs: Vec::new(),
+                stun_addrs: Vec::new(),
+                selected_media_path: String::new(),
+                webrtc_connection_state: String::new(),
+                path_scores: Vec::new(),
+                saved_peer_addrs: Vec::new(),
+                known_peers,
+                ignored_peer_ids: Vec::new(),
+                share_invite: None,
+            },
+            audio: AudioSummary {
+                backend: AudioBackend::Unknown,
+                output_strategy: OutputStrategy::LogicalPeerBusesOnly,
+                output_backend: String::new(),
+                capture_device: None,
+                available_capture_devices: Vec::new(),
+                sample_rate_hz: None,
+                engine: AudioEngineStage::Planned,
+                frame_size_ms: None,
+                codec: None,
+                source: None,
+                input_gain_percent: 100,
+            },
+            peers,
+            pending_peer_approvals,
+            notes: Vec::new(),
+        }
     }
 }

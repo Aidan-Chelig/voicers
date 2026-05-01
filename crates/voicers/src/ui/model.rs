@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use voicers_core::{DaemonStatus, KnownPeerSummary};
+use voicers_core::{DaemonStatus, KnownPeerSummary, PeerSessionState, PeerSummary};
 
 pub struct UiApp {
     pub control_addr: String,
@@ -93,15 +93,15 @@ impl UiApp {
     }
 
     pub fn selected_peer_id(&self) -> Option<String> {
-        self.status
-            .as_ref()?
-            .peers
+        visible_voice_peers(self.status.as_ref()?)
             .get(self.selected_peer)
             .map(|peer| peer.peer_id.clone())
     }
 
-    pub fn selected_peer(&self) -> Option<&voicers_core::PeerSummary> {
-        self.status.as_ref()?.peers.get(self.selected_peer)
+    pub fn selected_peer(&self) -> Option<&PeerSummary> {
+        visible_voice_peers(self.status.as_ref()?)
+            .get(self.selected_peer)
+            .copied()
     }
 
     pub fn selected_known_peer(&self) -> Option<&KnownPeerSummary> {
@@ -116,7 +116,7 @@ impl UiApp {
         let len = self
             .status
             .as_ref()
-            .map(|status| status.peers.len())
+            .map(|status| visible_voice_peers(status).len())
             .unwrap_or(0);
         if len == 0 {
             self.selected_peer = 0;
@@ -158,9 +158,13 @@ impl UiApp {
                     .cloned()
                     .map(ConfigItem::CaptureDevice),
             );
-            items.extend(status.peers.iter().map(|peer| ConfigItem::PeerVolume {
-                peer_id: peer.peer_id.clone(),
-            }));
+            items.extend(
+                visible_voice_peers(status)
+                    .into_iter()
+                    .map(|peer| ConfigItem::PeerVolume {
+                        peer_id: peer.peer_id.clone(),
+                    }),
+            );
         }
         items
     }
@@ -185,6 +189,14 @@ impl UiApp {
             self.flash_until = None;
         }
     }
+}
+
+pub fn visible_voice_peers(status: &DaemonStatus) -> Vec<&PeerSummary> {
+    status
+        .peers
+        .iter()
+        .filter(|peer| matches!(peer.session, PeerSessionState::Active { .. }))
+        .collect()
 }
 
 pub fn default_flash(screen: Screen) -> &'static str {

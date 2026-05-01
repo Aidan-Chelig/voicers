@@ -21,7 +21,7 @@ bytes = "1.11.0"
 cpal = "0.15.3"
 crossterm = "0.29.0"
 futures = "0.3.32"
-libp2p = { version = "0.56.0", features = ["cbor", "dcutr", "dns", "ed25519", "identify", "kad", "macros", "noise", "ping", "relay", "request-response", "tcp", "tokio", "upnp", "yamux"] }
+libp2p = { version = "0.56.0", features = ["cbor", "dcutr", "dns", "ed25519", "identify", "kad", "macros", "noise", "ping", "quic", "relay", "request-response", "rsa", "tcp", "tls", "tokio", "upnp", "websocket", "yamux"] }
 pipewire = "0.9.2"
 ratatui = "0.30.0"
 serde = { version = "1.0.228", features = ["derive"] }

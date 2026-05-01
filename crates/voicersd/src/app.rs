@@ -171,7 +171,8 @@ impl App {
                 webrtc_connection_states,
                 media.clone(),
                 persistence.clone(),
-            )?
+            )
+            .await?
         } else {
             {
                 let mut state = state.write().await;

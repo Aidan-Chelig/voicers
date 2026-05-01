@@ -400,6 +400,10 @@ pub fn encode_compact_invite(target: &str) -> String {
     format!("{COMPACT_INVITE_PREFIX}{encoded}")
 }
 
+pub fn encode_join_namespace_invite(namespace: &str) -> String {
+    format!("{COMPACT_INVITE_PREFIX}{}", namespace.trim())
+}
+
 pub fn encode_peer_compact_invite(
     peer_id: &str,
     addrs: &[String],
@@ -440,7 +444,7 @@ pub fn parse_join_target(value: &str) -> JoinTarget {
     };
 
     let Ok(decoded) = URL_SAFE_NO_PAD.decode(payload) else {
-        return JoinTarget::Raw(trimmed.to_string());
+        return JoinTarget::Raw(payload.trim().to_string());
     };
 
     if let Ok(invite) = serde_json::from_slice::<CompactInviteV1>(&decoded) {
@@ -463,7 +467,7 @@ pub fn parse_join_target(value: &str) -> JoinTarget {
 
     match String::from_utf8(decoded) {
         Ok(decoded) => JoinTarget::Raw(decoded.trim().to_string()),
-        Err(_) => JoinTarget::Raw(trimmed.to_string()),
+        Err(_) => JoinTarget::Raw(payload.trim().to_string()),
     }
 }
 
@@ -477,8 +481,9 @@ pub fn normalize_join_target(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_compact_invite, encode_compact_invite, encode_peer_compact_invite,
-        normalize_join_target, parse_join_target, CompactInviteV1, JoinTarget,
+        decode_compact_invite, encode_compact_invite, encode_join_namespace_invite,
+        encode_peer_compact_invite, normalize_join_target, parse_join_target, CompactInviteV1,
+        JoinTarget,
     };
 
     #[test]
@@ -524,5 +529,15 @@ mod tests {
             other => panic!("expected structured invite, got {other:?}"),
         }
         assert_eq!(normalize_join_target(&invite), "12D3KooWExamplePeer");
+    }
+
+    #[test]
+    fn namespace_invite_round_trips_short_code() {
+        let invite = encode_join_namespace_invite("abc123");
+        match parse_join_target(&invite) {
+            JoinTarget::Raw(target) => assert_eq!(target, "abc123"),
+            other => panic!("expected raw namespace, got {other:?}"),
+        }
+        assert_eq!(normalize_join_target(&invite), "abc123");
     }
 }
