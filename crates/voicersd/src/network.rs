@@ -5,6 +5,7 @@ mod stun;
 
 use std::{
     collections::{HashMap, HashSet},
+    env,
     time::Duration,
 };
 
@@ -2334,16 +2335,17 @@ fn shareable_address(address: &str, local_peer_id: &str) -> Option<String> {
 }
 
 fn is_shareable_multiaddr(address: &Multiaddr) -> bool {
+    let allow_loopback = env::var_os("VOICERS_ALLOW_LOOPBACK_INVITES").is_some();
     for protocol in address.iter() {
         match protocol {
             Protocol::Ip4(ip) => {
-                if ip.is_unspecified() || ip.is_loopback() {
+                if ip.is_unspecified() || (ip.is_loopback() && !allow_loopback) {
                     return false;
                 }
                 return true;
             }
             Protocol::Ip6(ip) => {
-                if ip.is_unspecified() || ip.is_loopback() {
+                if ip.is_unspecified() || (ip.is_loopback() && !allow_loopback) {
                     return false;
                 }
                 return true;

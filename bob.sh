@@ -4,6 +4,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 mkdir -p /tmp/voicers-demo
+state_path=/tmp/voicers-demo/bob.json
+log_path=/tmp/voicers-demo/bob.log
+listen_ip=127.0.0.1
 
 daemon_pid=""
 cleanup() {
@@ -14,15 +17,16 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-./target/debug/voicersd \
+rm -f "${state_path}" "${log_path}"
+
+VOICERS_ALLOW_LOOPBACK_INVITES=1 ./target/debug/voicersd \
   --display-name Bob \
   --control-addr 127.0.0.1:7768 \
-  --listen-addr /ip4/127.0.0.1/tcp/4002 \
-  --state-path /tmp/voicers-demo/bob.json \
-  --no-capture \
+  --listen-addr "/ip4/${listen_ip}/tcp/4002" \
+  --state-path "${state_path}" \
   --no-bootstrap \
   --no-stun \
-  >/tmp/voicers-demo/bob.log 2>&1 &
+  >"${log_path}" 2>&1 &
 daemon_pid=$!
 
 for _ in {1..50}; do
@@ -33,8 +37,13 @@ for _ in {1..50}; do
 done
 
 if ! bash -c 'exec 3<>/dev/tcp/127.0.0.1/7768' >/dev/null 2>&1; then
-  echo "Bob daemon did not become ready. Check /tmp/voicers-demo/bob.log" >&2
+  echo "Bob daemon did not become ready. Check ${log_path}" >&2
   exit 1
 fi
+
+cat <<EOF
+Bob is ready on ${listen_ip}:4002.
+Wait for Alice to copy her invite with i, then paste it here with Enter.
+EOF
 
 ./target/debug/voicers --control-addr 127.0.0.1:7768
