@@ -1522,7 +1522,10 @@ fn update_share_invite(state: &mut DaemonStatus) {
                 .network
                 .share_invite
                 .clone()
-                .filter(|invite| !invite.is_empty())
+                .filter(|invite| {
+                    !invite.is_empty()
+                        && shareable_address(invite, &state.local_peer_id).is_some()
+                })
         });
 }
 
@@ -1619,13 +1622,13 @@ fn is_shareable_multiaddr(address: &Multiaddr) -> bool {
     for protocol in address.iter() {
         match protocol {
             Protocol::Ip4(ip) => {
-                if ip.is_unspecified() {
+                if ip.is_unspecified() || ip.is_loopback() {
                     return false;
                 }
                 return true;
             }
             Protocol::Ip6(ip) => {
-                if ip.is_unspecified() {
+                if ip.is_unspecified() || ip.is_loopback() {
                     return false;
                 }
                 return true;
@@ -1656,4 +1659,27 @@ async fn persist_network_snapshot(
 
 fn short_peer_id(peer_id: &str) -> &str {
     peer_id.get(0..12).unwrap_or(peer_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_shareable_multiaddr, shareable_address};
+    use libp2p::Multiaddr;
+
+    #[test]
+    fn loopback_addresses_are_not_shareable() {
+        let loopback: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
+        assert!(!is_shareable_multiaddr(&loopback));
+        assert!(shareable_address("/ip4/127.0.0.1/tcp/4001", "peer-id").is_none());
+    }
+
+    #[test]
+    fn lan_addresses_remain_shareable() {
+        let lan: Multiaddr = "/ip4/192.168.1.50/tcp/27015".parse().unwrap();
+        assert!(is_shareable_multiaddr(&lan));
+        assert_eq!(
+            shareable_address("/ip4/192.168.1.50/tcp/27015", "peer-id").as_deref(),
+            Some("/ip4/192.168.1.50/tcp/27015/p2p/peer-id")
+        );
+    }
 }
