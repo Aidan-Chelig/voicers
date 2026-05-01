@@ -8,7 +8,7 @@ let
     alsa-lib
     udev
     vulkan-loader
-    opusTools
+    opus-tools
     pipewire
     llvmPackages.libclang
   ];
@@ -31,7 +31,7 @@ pkgs.mkShell {
   ];
 
   buildInputs = with pkgs; [
-    opusTools
+    opus-tools
     lld
   ]
   ++ lib.optionals stdenv.isLinux (with pkgs; [
