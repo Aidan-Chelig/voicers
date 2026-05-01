@@ -2,6 +2,7 @@ mod client;
 mod ui;
 
 use std::{
+    io::Write,
     path::Path,
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -187,11 +188,29 @@ async fn handle_main_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
                 .as_ref()
                 .and_then(|status| status.network.share_invite.clone())
                 .unwrap_or_else(|| "no shareable invite yet".to_string());
-            app.set_flash(invite);
+            match copy_to_clipboard(&invite) {
+                Ok(()) => app.set_flash("invite copied to clipboard"),
+                Err(error) => app.set_flash(format!("clipboard copy failed: {error}; invite: {invite}")),
+            }
+        }
+        KeyCode::Char('C') => {
+            let response =
+                client::send_request_to(&app.control_addr, ControlRequest::RotateInviteCode).await;
+            app.set_flash(render_message(response));
+            refresh_status(app).await;
         }
         KeyCode::Char('r') => {
             app.input_mode = InputMode::Room;
             app.set_flash_persistent("enter room name and press Enter");
+        }
+        KeyCode::Char('y') => {
+            approve_first_pending_peer(app, false).await;
+        }
+        KeyCode::Char('w') => {
+            approve_first_pending_peer(app, true).await;
+        }
+        KeyCode::Char('n') => {
+            reject_first_pending_peer(app).await;
         }
         KeyCode::Char('u') => {
             app.rename_input = app
@@ -662,6 +681,46 @@ async fn forget_selected_known_peer(app: &mut UiApp) {
     refresh_status(app).await;
 }
 
+async fn approve_first_pending_peer(app: &mut UiApp, whitelist: bool) {
+    let Some(peer_id) = app
+        .status
+        .as_ref()
+        .and_then(|status| status.pending_peer_approvals.first())
+        .map(|pending| pending.peer_id.clone())
+    else {
+        app.set_flash("no pending peer approvals");
+        return;
+    };
+
+    let response = client::send_request_to(
+        &app.control_addr,
+        ControlRequest::ApprovePendingPeer { peer_id, whitelist },
+    )
+    .await;
+    app.set_flash(render_message(response));
+    refresh_status(app).await;
+}
+
+async fn reject_first_pending_peer(app: &mut UiApp) {
+    let Some(peer_id) = app
+        .status
+        .as_ref()
+        .and_then(|status| status.pending_peer_approvals.first())
+        .map(|pending| pending.peer_id.clone())
+    else {
+        app.set_flash("no pending peer approvals");
+        return;
+    };
+
+    let response = client::send_request_to(
+        &app.control_addr,
+        ControlRequest::RejectPendingPeer { peer_id },
+    )
+    .await;
+    app.set_flash(render_message(response));
+    refresh_status(app).await;
+}
+
 fn launch_daemon(app: &mut UiApp, auto: bool) -> bool {
     if auto && app.daemon_launch.attempted_auto_start {
         return false;
@@ -707,6 +766,49 @@ fn spawn_daemon(daemon_bin: &Path, control_addr: &str) -> Result<()> {
         .stderr(Stdio::null())
         .spawn()?;
     Ok(())
+}
+
+fn copy_to_clipboard(value: &str) -> Result<()> {
+    const CLIPBOARD_COMMANDS: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+        ("pbcopy", &[]),
+        ("clip.exe", &[]),
+    ];
+
+    let mut last_error = None;
+    for (program, args) in CLIPBOARD_COMMANDS {
+        match write_to_command_stdin(program, args, value) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(format!("{program}: {error}")),
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "{}",
+        last_error.unwrap_or_else(|| "no clipboard command available".to_string())
+    ))
+}
+
+fn write_to_command_stdin(program: &str, args: &[&str], value: &str) -> Result<()> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(value.as_bytes())?;
+    }
+
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("exited with status {status}");
+    }
 }
 
 fn render_message(response: Result<ControlResponse>) -> String {
@@ -997,11 +1099,68 @@ fn draw_home_panel(frame: &mut Frame, app: &UiApp, area: Rect) {
                 ),
             ]),
             Line::from(Span::styled(invite, Style::default().fg(color_text()))),
+            Line::from(vec![
+                label("CODE"),
+                Span::raw(" "),
+                Span::styled(
+                    status
+                        .session
+                        .invite_code
+                        .clone()
+                        .unwrap_or_else(|| "<none>".to_string()),
+                    Style::default().fg(color_text()),
+                ),
+            ]),
+            Line::from(vec![
+                label("EXPIRES"),
+                Span::raw(" "),
+                Span::styled(
+                    status
+                        .session
+                        .invite_expires_at_ms
+                        .map(|timestamp| timestamp.to_string())
+                        .unwrap_or_else(|| "<none>".to_string()),
+                    Style::default().fg(color_muted()),
+                ),
+            ]),
             Line::from(""),
             Line::from("1. Share this invite."),
             Line::from("2. Your friend opens Voicers and presses Enter."),
             Line::from("3. They paste the invite and press Enter again."),
         ];
+
+        if let Some(pending) = status.pending_peer_approvals.first() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Pending Approval",
+                    Style::default()
+                        .fg(color_text())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                badge("waiting", color_warn(), color_bg()),
+            ]));
+            lines.push(Line::from(format!(
+                "{} @{}",
+                pending.display_name,
+                short_id(&pending.peer_id)
+            )));
+            lines.push(Line::from(Span::styled(
+                pending.address.clone(),
+                Style::default().fg(color_subtle()),
+            )));
+            if let Some(room_name) = &pending.room_name {
+                lines.push(Line::from(vec![
+                    label("ROOM"),
+                    Span::raw(" "),
+                    Span::styled(room_name.clone(), Style::default().fg(color_text())),
+                ]));
+            }
+            lines.push(Line::from(
+                "Press y to allow once, w to allow and whitelist, or n to reject.",
+            ));
+        }
 
         if let Some(peer) = app.selected_peer() {
             lines.push(Line::from(""));
@@ -1531,6 +1690,12 @@ fn draw_help_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
     lines.push(Line::from(""));
     lines.push(Line::from(
         "Known Peers reconnect issues JoinPeer with the selected peer id instead of one hard-coded address.",
+    ));
+    lines.push(Line::from(
+        "Custom rooms publish short-lived invite codes; press C on the main screen to rotate the current code.",
+    ));
+    lines.push(Line::from(
+        "First-time inbound room joins are held for approval; use y to allow once, w to whitelist, or n to reject.",
     ));
     lines.push(Line::from(
         "The daemon ranks direct and relayed saved addresses, then retries the next candidate after an outbound dial failure.",

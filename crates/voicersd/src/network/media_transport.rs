@@ -246,6 +246,14 @@ pub(super) fn resolve_ranked_dial_target(
         }
     }
 
+    if requested.parse::<libp2p::PeerId>().is_ok() {
+        return RankedDialTarget {
+            peer_id: Some(requested.to_string()),
+            primary: requested.to_string(),
+            fallbacks: Vec::new(),
+        };
+    }
+
     RankedDialTarget {
         peer_id: None,
         primary: requested.to_string(),
@@ -387,6 +395,8 @@ mod tests {
                 room_name: None,
                 display_name: "local".to_string(),
                 self_muted: false,
+                invite_code: None,
+                invite_expires_at_ms: None,
             },
             network: NetworkSummary {
                 implementation: "libp2p".to_string(),
@@ -418,6 +428,7 @@ mod tests {
                 input_gain_percent: 100,
             },
             peers: Vec::new(),
+            pending_peer_approvals: Vec::new(),
             notes: Vec::new(),
         }
     }
@@ -456,6 +467,7 @@ mod tests {
             )),
             connected: false,
             pinned: true,
+            whitelisted: false,
         });
         status
             .network
@@ -496,6 +508,7 @@ mod tests {
             last_dial_addr: None,
             connected: false,
             pinned: true,
+            whitelisted: false,
         });
 
         let ranked = resolve_ranked_dial_target(
@@ -519,6 +532,8 @@ mod tests {
                 room_name: None,
                 display_name: "local".to_string(),
                 self_muted: false,
+                invite_code: None,
+                invite_expires_at_ms: None,
             },
             network: NetworkSummary {
                 implementation: "libp2p".to_string(),
@@ -550,6 +565,7 @@ mod tests {
                 input_gain_percent: 100,
             },
             peers: Vec::new(),
+            pending_peer_approvals: Vec::new(),
             notes: Vec::new(),
         }
     }

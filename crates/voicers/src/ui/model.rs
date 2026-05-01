@@ -190,7 +190,7 @@ impl UiApp {
 pub fn default_flash(screen: Screen) -> &'static str {
     match screen {
         Screen::Main => {
-            "q quit | ? help | enter or d join with invite | i show my invite | m mute self | p peers | c config"
+            "q quit | ? help | enter or d join | i show invite | C rotate code | y allow | w whitelist | n reject | m mute | p peers | c config"
         }
         Screen::Config => {
             "q quit | ? help | c back | p peers | u rename self | enter select device | hjkl or arrows navigate"

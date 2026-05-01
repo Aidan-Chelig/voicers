@@ -94,6 +94,11 @@ ranking is biased toward previously successful direct paths, then previously
 successful relayed paths, with the most recently used address used as a
 tiebreaker.
 
+If the daemon does not already have a dialable address for that peer id, it now
+queries the DHT for a peer-id keyed rendezvous record, seeds any returned
+address hints into the local address book, and then runs the same ranked dial
+path.
+
 If the first outbound dial fails, the daemon automatically retries the next
 ranked saved address for that same peer. This fallback loop is daemon-side, so
 the TUI and control clients only need to issue one `JoinPeer` request.
@@ -102,6 +107,23 @@ The same ranking logic also applies when the request is a multiaddr that
 already includes a known peer id. In that case the requested multiaddr is kept
 as a candidate, but the daemon also considers the peer's other saved addresses
 before deciding the retry order.
+
+For explicit custom room names or invite codes, `JoinPeer.address` may also be a
+plain namespace string such as `dev-room-42`. In that case the daemon performs
+a DHT rendezvous lookup for that namespace and attempts to dial every peer
+record returned by the query. The automatic default room `main` is not
+published to the DHT, so only explicitly chosen non-default room names act as
+public rendezvous namespaces.
+
+When a daemon is in a custom room, it also generates a short-lived invite code
+for that room and includes it in the share invite. Rotating the code changes
+the rendezvous namespace without changing the room identity shown to approved
+peers.
+
+The first time an unknown peer tries to join your room, `voicersd` now holds
+that inbound join until you approve or reject it. The TUI exposes `y` to allow
+once, `w` to allow and whitelist the peer for future automatic joins, and `n`
+to reject the request.
 
 For peers on separate home networks, direct dialing only works when at least one
 peer has a reachable public address, a port forward, or a working automatic port
@@ -151,7 +173,9 @@ Each user can run the TUI in another terminal:
 
 Alice gets her status and shares `network.share_invite` with Bob. The normal
 share string is now a compact `voicers://join/...` invite instead of a raw
-multiaddr. The daemon still accepts raw multiaddrs for debugging and explicit
+multiaddr. New invites are peer-id-first and carry one or more shareable
+address hints so the receiving daemon can seed its address book, then dial by
+peer id. The daemon still accepts raw multiaddrs for debugging and explicit
 dials, but the intended user-facing flow is invite-first.
 
 ```sh
@@ -260,10 +284,11 @@ arguments:
   --bootstrap-addr /dnsaddr/bootstrap.example.net/p2p/ANOTHER_BOOTSTRAP_PEER_ID
 ```
 
-The current DHT support is for bootstrap, routing-table discovery, relay
-candidate discovery, and relay reservation attempts. It does not yet provide
-room-name or user-name rendezvous. For now, peers still need to exchange a
-specific multiaddr out of band or through a future rendezvous layer.
+The current DHT support now covers bootstrap, routing-table discovery,
+peer-id-keyed rendezvous records, non-default room/invite-code namespaces,
+relay candidate discovery, and relay reservation attempts. Invites are
+peer-id-first with embedded address hints; peer-id and room/code joins can also
+resolve through the DHT when bootstrap connectivity is available.
 
 ## Testing Ranked Fallback Locally
 

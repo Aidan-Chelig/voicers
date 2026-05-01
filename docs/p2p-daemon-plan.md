@@ -49,7 +49,7 @@ Implemented:
 
 Still pending:
 
-- DHT-backed room or user rendezvous
+- user-friendly invite-code generation and lifecycle management
 - project-controlled relay-server mode
 - NAT-PMP/PCP support
 - project-controlled TURN deployment automation
@@ -203,4 +203,6 @@ Deliver a daemon/TUI scaffold that compiles and proves:
 12. Done: expose media path selection and WebRTC connection state in daemon/TUI status.
 13. Done: persist score counters for direct, relayed, DCUtR, and WebRTC selected paths.
 14. Next: use scored addresses and paths to prioritize reconnect attempts.
-15. Next: add rendezvous records on the DHT for room or invite-code discovery.
+15. Done: switch share invites from "base64 raw multiaddr" to "peer id plus optional address hints" so identity is stable even when transport addresses change.
+16. Done: publish peer-id keyed and non-default room keyed rendezvous records on the DHT, and use them to resolve joins before dialing.
+17. Done: add generated invite codes with expiry and rotation on top of the room/code rendezvous namespace, and gate first-time inbound room joins behind explicit allow or whitelist decisions.

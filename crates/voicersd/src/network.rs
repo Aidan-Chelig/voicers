@@ -15,11 +15,12 @@ use libp2p::{
     request_response, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, upnp, yamux, Multiaddr,
     PeerId, StreamProtocol, SwarmBuilder,
 };
+use serde_json;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use voicers_core::{
-    encode_compact_invite, DaemonStatus, KnownPeerSummary, MediaRequest, MediaResponse,
-    MediaStreamState, PathScoreSummary, PeerMediaState, PeerSessionState, PeerSummary,
-    PeerTransportState, SessionHello, SessionRequest, SessionResponse, WebRtcSignal,
+    encode_peer_compact_invite, CompactInviteV1, DaemonStatus, KnownPeerSummary, MediaRequest,
+    MediaResponse, MediaStreamState, PathScoreSummary, PeerMediaState, PeerSessionState,
+    PeerSummary, PeerTransportState, SessionHello, SessionRequest, SessionResponse, WebRtcSignal,
 };
 
 use std::sync::Arc;
@@ -43,6 +44,8 @@ const PROTOCOL_VERSION: &str = "/voicers/0.1.0";
 const SESSION_PROTOCOL: StreamProtocol = StreamProtocol::new("/voicers/session/0.1.0");
 const MEDIA_PROTOCOL: StreamProtocol = StreamProtocol::new("/voicers/media/0.1.0");
 const MAX_AUTO_RELAY_CANDIDATES: usize = 4;
+const RENDEZVOUS_RECORD_PREFIX: &str = "/voicers/rendezvous/v1/";
+const DEFAULT_ROOM_NAMESPACE: &str = "main";
 const DEFAULT_BOOTSTRAP_ADDRS: &[&str] = &[
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
@@ -160,6 +163,30 @@ impl NetworkHandle {
             .await
             .context("network task dropped WebRTC offer response")?
     }
+
+    pub async fn approve_pending_peer(&self, peer_id: String) -> Result<String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(NetworkCommand::ApprovePendingPeer { peer_id, response_tx })
+            .await
+            .context("failed to send approve-peer command to network task")?;
+
+        response_rx
+            .await
+            .context("network task dropped approve-peer response")?
+    }
+
+    pub async fn reject_pending_peer(&self, peer_id: String) -> Result<String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(NetworkCommand::RejectPendingPeer { peer_id, response_tx })
+            .await
+            .context("failed to send reject-peer command to network task")?;
+
+        response_rx
+            .await
+            .context("network task dropped reject-peer response")?
+    }
 }
 
 pub struct NetworkBootstrap {
@@ -171,6 +198,20 @@ pub struct NetworkBootstrap {
 struct PendingDial {
     current_address: String,
     fallback_addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+enum PendingRendezvousLookup {
+    PeerId(String),
+    Room {
+        room_name: String,
+        resolved_peers: HashSet<String>,
+    },
+}
+
+struct PendingInboundApproval {
+    hello: SessionHello,
+    channel: request_response::ResponseChannel<SessionResponse>,
 }
 
 enum NetworkCommand {
@@ -190,6 +231,14 @@ enum NetworkCommand {
     StartWebRtcOffer {
         peer_id: String,
         response_tx: oneshot::Sender<Result<()>>,
+    },
+    ApprovePendingPeer {
+        peer_id: String,
+        response_tx: oneshot::Sender<Result<String>>,
+    },
+    RejectPendingPeer {
+        peer_id: String,
+        response_tx: oneshot::Sender<Result<String>>,
     },
     SendMediaFrame {
         peer_id: String,
@@ -359,6 +408,10 @@ async fn run_network_task(
     let mut active_media_flows = HashSet::new();
     let mut attempted_relays = HashSet::new();
     let mut pending_dials = HashMap::new();
+    let mut pending_rendezvous_lookups = HashMap::new();
+    let mut pending_rendezvous_publications = HashMap::new();
+    let mut published_rendezvous_records = HashMap::new();
+    let mut pending_inbound_approvals = HashMap::new();
 
     loop {
         tokio::select! {
@@ -369,6 +422,10 @@ async fn run_network_task(
                     &command_tx,
                     &mut active_media_flows,
                     &mut pending_dials,
+                    &mut pending_rendezvous_lookups,
+                    &mut pending_rendezvous_publications,
+                    &mut published_rendezvous_records,
+                    &mut pending_inbound_approvals,
                     &media,
                     command,
                 ).await;
@@ -381,6 +438,10 @@ async fn run_network_task(
                     &mut active_media_flows,
                     &mut attempted_relays,
                     &mut pending_dials,
+                    &mut pending_rendezvous_lookups,
+                    &mut pending_rendezvous_publications,
+                    &mut published_rendezvous_records,
+                    &mut pending_inbound_approvals,
                     &media,
                     &persistence,
                     event,
@@ -406,6 +467,10 @@ async fn run_network_task(
     let mut active_media_flows = HashSet::new();
     let mut attempted_relays = HashSet::new();
     let mut pending_dials = HashMap::new();
+    let mut pending_rendezvous_lookups = HashMap::new();
+    let mut pending_rendezvous_publications = HashMap::new();
+    let mut published_rendezvous_records = HashMap::new();
+    let mut pending_inbound_approvals = HashMap::new();
 
     loop {
         tokio::select! {
@@ -416,6 +481,10 @@ async fn run_network_task(
                     &command_tx,
                     &mut active_media_flows,
                     &mut pending_dials,
+                    &mut pending_rendezvous_lookups,
+                    &mut pending_rendezvous_publications,
+                    &mut published_rendezvous_records,
+                    &mut pending_inbound_approvals,
                     &webrtc,
                     &media,
                     command,
@@ -444,6 +513,10 @@ async fn run_network_task(
                     &mut active_media_flows,
                     &mut attempted_relays,
                     &mut pending_dials,
+                    &mut pending_rendezvous_lookups,
+                    &mut pending_rendezvous_publications,
+                    &mut published_rendezvous_records,
+                    &mut pending_inbound_approvals,
                     &webrtc,
                     &media,
                     &persistence,
@@ -460,6 +533,10 @@ async fn handle_command(
     command_tx: &mpsc::Sender<NetworkCommand>,
     active_media_flows: &mut HashSet<String>,
     pending_dials: &mut HashMap<String, PendingDial>,
+    pending_rendezvous_lookups: &mut HashMap<kad::QueryId, PendingRendezvousLookup>,
+    pending_rendezvous_publications: &mut HashMap<kad::QueryId, (String, Vec<u8>)>,
+    published_rendezvous_records: &mut HashMap<String, Vec<u8>>,
+    pending_inbound_approvals: &mut HashMap<String, PendingInboundApproval>,
     #[cfg(feature = "webrtc-transport")] webrtc: &Option<WebRtcHandle>,
     media: &MediaHandle,
     command: NetworkCommand,
@@ -469,11 +546,25 @@ async fn handle_command(
             address,
             response_tx,
         } => {
-            let response = dial_peer(state, swarm, pending_dials, &address).await;
+            let response = dial_peer(
+                state,
+                swarm,
+                pending_dials,
+                pending_rendezvous_lookups,
+                &address,
+            )
+            .await;
             let _ = response_tx.send(response);
         }
         NetworkCommand::BroadcastSessionHello { hello, response_tx } => {
             let response = broadcast_session_hello(swarm, hello).await;
+            maybe_publish_rendezvous_record(
+                state,
+                swarm,
+                pending_rendezvous_publications,
+                published_rendezvous_records,
+            )
+            .await;
             let _ = response_tx.send(response);
         }
         NetworkCommand::SendWebRtcSignal {
@@ -498,6 +589,29 @@ async fn handle_command(
             ));
             let _ = response_tx.send(response);
         }
+        NetworkCommand::ApprovePendingPeer { peer_id, response_tx } => {
+            let response = approve_pending_peer(
+                state,
+                swarm,
+                command_tx,
+                active_media_flows,
+                pending_inbound_approvals,
+                &peer_id,
+                media,
+            )
+            .await;
+            let _ = response_tx.send(response);
+        }
+        NetworkCommand::RejectPendingPeer { peer_id, response_tx } => {
+            let response = reject_pending_peer(
+                state,
+                swarm,
+                pending_inbound_approvals,
+                &peer_id,
+            )
+            .await;
+            let _ = response_tx.send(response);
+        }
         NetworkCommand::SendMediaFrame { peer_id } => {
             if active_media_flows.contains(&peer_id) {
                 #[cfg(feature = "webrtc-transport")]
@@ -514,6 +628,7 @@ async fn dial_peer(
     state: &Arc<RwLock<DaemonStatus>>,
     swarm: &mut libp2p::Swarm<VoicersBehaviour>,
     pending_dials: &mut HashMap<String, PendingDial>,
+    pending_rendezvous_lookups: &mut HashMap<kad::QueryId, PendingRendezvousLookup>,
     address: &str,
 ) -> Result<String> {
     let ranked = {
@@ -521,37 +636,45 @@ async fn dial_peer(
         resolve_ranked_dial_target(&state.network, address)
     };
 
-    let multiaddr: Multiaddr = ranked
-        .primary
-        .parse()
-        .with_context(|| format!("invalid multiaddr: {}", ranked.primary))?;
+    let multiaddr: Multiaddr = match ranked.primary.parse() {
+        Ok(multiaddr) => multiaddr,
+        Err(_) if ranked.peer_id.is_some() => {
+            let peer_id = ranked.peer_id.expect("checked above");
+            let query_id = swarm
+                .behaviour_mut()
+                .kad
+                .get_record(kad::RecordKey::new(&rendezvous_record_key(&peer_id)));
+            pending_rendezvous_lookups.insert(query_id, PendingRendezvousLookup::PeerId(peer_id.clone()));
+            push_note(
+                state,
+                format!("resolving rendezvous record for {peer_id} through the DHT"),
+            )
+            .await;
+            return Ok(format!("resolving {peer_id} through the DHT"));
+        }
+        Err(_) => {
+            let room_name = address.trim().to_string();
+            let query_id = swarm
+                .behaviour_mut()
+                .kad
+                .get_record(kad::RecordKey::new(&room_rendezvous_record_key(&room_name)));
+            pending_rendezvous_lookups.insert(
+                query_id,
+                PendingRendezvousLookup::Room {
+                    room_name: room_name.clone(),
+                    resolved_peers: HashSet::new(),
+                },
+            );
+            push_note(
+                state,
+                format!("resolving room/invite code `{room_name}` through the DHT"),
+            )
+            .await;
+            return Ok(format!("resolving room `{room_name}` through the DHT"));
+        }
+    };
 
-    swarm
-        .dial(multiaddr.clone())
-        .with_context(|| format!("failed to dial {multiaddr}"))?;
-    if let Some(peer_id) = ranked.peer_id {
-        pending_dials.insert(
-            peer_id,
-            PendingDial {
-                current_address: ranked.primary.clone(),
-                fallback_addresses: ranked.fallbacks.clone(),
-            },
-        );
-    }
-    if ranked.fallbacks.is_empty() {
-        push_note(state, format!("dialing {multiaddr}")).await;
-    } else {
-        push_note(
-            state,
-            format!(
-                "dialing {multiaddr}; ranked fallbacks: {}",
-                ranked.fallbacks.join(", ")
-            ),
-        )
-        .await;
-    }
-
-    Ok(format!("dialing {multiaddr}"))
+    dial_ranked_target(state, swarm, pending_dials, ranked, multiaddr).await
 }
 
 async fn broadcast_session_hello(
@@ -622,6 +745,10 @@ async fn handle_swarm_event(
     active_media_flows: &mut HashSet<String>,
     attempted_relays: &mut HashSet<PeerId>,
     pending_dials: &mut HashMap<String, PendingDial>,
+    pending_rendezvous_lookups: &mut HashMap<kad::QueryId, PendingRendezvousLookup>,
+    pending_rendezvous_publications: &mut HashMap<kad::QueryId, (String, Vec<u8>)>,
+    published_rendezvous_records: &mut HashMap<String, Vec<u8>>,
+    pending_inbound_approvals: &mut HashMap<String, PendingInboundApproval>,
     #[cfg(feature = "webrtc-transport")] webrtc: &Option<WebRtcHandle>,
     media: &MediaHandle,
     persistence: &PersistenceHandle,
@@ -643,6 +770,13 @@ async fn handle_swarm_event(
                 };
                 insert_unique_note(&mut state, format!("listening on {rendered}"));
             }
+            maybe_publish_rendezvous_record(
+                state,
+                swarm,
+                pending_rendezvous_publications,
+                published_rendezvous_records,
+            )
+            .await;
             persist_network_snapshot(state, persistence).await;
         }
         SwarmEvent::NewExternalAddrCandidate { address } => {
@@ -654,26 +788,53 @@ async fn handle_swarm_event(
                 update_share_invite(&mut state);
                 insert_unique_note(&mut state, format!("confirmed observed address {rendered}"));
             }
+            maybe_publish_rendezvous_record(
+                state,
+                swarm,
+                pending_rendezvous_publications,
+                published_rendezvous_records,
+            )
+            .await;
         }
         SwarmEvent::ExternalAddrConfirmed { address } => {
-            let mut state = state.write().await;
-            let rendered = address.to_string();
-            insert_unique_addr(&mut state.network.external_addrs, rendered.clone());
-            state.network.nat_status = if is_relayed_addr(&address) {
-                "relay reservation active".to_string()
-            } else {
-                "external address confirmed".to_string()
-            };
-            update_share_invite(&mut state);
-            insert_unique_note(&mut state, format!("external address confirmed {rendered}"));
+            {
+                let mut state = state.write().await;
+                let rendered = address.to_string();
+                insert_unique_addr(&mut state.network.external_addrs, rendered.clone());
+                state.network.nat_status = if is_relayed_addr(&address) {
+                    "relay reservation active".to_string()
+                } else {
+                    "external address confirmed".to_string()
+                };
+                update_share_invite(&mut state);
+                insert_unique_note(&mut state, format!("external address confirmed {rendered}"));
+            }
+            maybe_publish_rendezvous_record(
+                state,
+                swarm,
+                pending_rendezvous_publications,
+                published_rendezvous_records,
+            )
+            .await;
+            persist_network_snapshot(state, persistence).await;
         }
         SwarmEvent::ExternalAddrExpired { address } => {
-            let mut state = state.write().await;
-            let rendered = address.to_string();
-            remove_addr(&mut state.network.external_addrs, &rendered);
-            remove_addr(&mut state.network.observed_addrs, &rendered);
-            update_share_invite(&mut state);
-            insert_unique_note(&mut state, format!("external address expired {rendered}"));
+            {
+                let mut state = state.write().await;
+                let rendered = address.to_string();
+                remove_addr(&mut state.network.external_addrs, &rendered);
+                remove_addr(&mut state.network.observed_addrs, &rendered);
+                update_share_invite(&mut state);
+                insert_unique_note(&mut state, format!("external address expired {rendered}"));
+            }
+            maybe_publish_rendezvous_record(
+                state,
+                swarm,
+                pending_rendezvous_publications,
+                published_rendezvous_records,
+            )
+            .await;
+            persist_network_snapshot(state, persistence).await;
         }
         SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
@@ -713,7 +874,13 @@ async fn handle_swarm_event(
                 ),
             )
             .await;
-            send_session_hello(swarm, &peer.peer_id, local_hello).await;
+            let should_send_hello = match &endpoint {
+                libp2p::core::ConnectedPoint::Dialer { .. } => true,
+                libp2p::core::ConnectedPoint::Listener { .. } => is_peer_whitelisted(state, &peer.peer_id).await,
+            };
+            if should_send_hello {
+                send_session_hello(swarm, &peer.peer_id, local_hello).await;
+            }
         }
         SwarmEvent::ConnectionClosed {
             peer_id,
@@ -898,6 +1065,13 @@ async fn handle_swarm_event(
                 update_share_invite(&mut state);
                 insert_unique_note(&mut state, format!("identified peer {}", identified_peer.0));
             }
+            maybe_publish_rendezvous_record(
+                state,
+                swarm,
+                pending_rendezvous_publications,
+                published_rendezvous_records,
+            )
+            .await;
             persist_network_snapshot(state, persistence).await;
         }
         SwarmEvent::Behaviour(VoicersBehaviourEvent::Identify(identify::Event::Sent {
@@ -984,23 +1158,177 @@ async fn handle_swarm_event(
             } => {
                 if is_new_peer {
                     push_note(state, format!("DHT discovered peer {peer}")).await;
+                    maybe_publish_rendezvous_record(
+                        state,
+                        swarm,
+                        pending_rendezvous_publications,
+                        published_rendezvous_records,
+                    )
+                    .await;
                 }
             }
-            kad::Event::OutboundQueryProgressed { result, .. } => match result {
+            kad::Event::OutboundQueryProgressed { id, result, .. } => match result {
                 kad::QueryResult::Bootstrap(Ok(ok)) => {
-                    let mut state = state.write().await;
-                    state.network.transport_stage =
+                    let mut daemon_state = state.write().await;
+                    daemon_state.network.transport_stage =
                         "tcp+relay+dcutr+dht active; bootstrap in progress".to_string();
                     insert_unique_note(
-                        &mut state,
+                        &mut daemon_state,
                         format!(
                             "DHT bootstrap query reached {}; {} remaining",
                             ok.peer, ok.num_remaining
                         ),
                     );
+                    drop(daemon_state);
+                    maybe_publish_rendezvous_record(
+                        state,
+                        swarm,
+                        pending_rendezvous_publications,
+                        published_rendezvous_records,
+                    )
+                    .await;
                 }
                 kad::QueryResult::Bootstrap(Err(error)) => {
                     push_note(state, format!("DHT bootstrap failed: {error}")).await;
+                }
+                kad::QueryResult::PutRecord(Ok(_)) => {
+                    if let Some((key, payload)) = pending_rendezvous_publications.remove(&id) {
+                        published_rendezvous_records.insert(key, payload);
+                        push_note(state, "published rendezvous record to the DHT".to_string()).await;
+                    }
+                }
+                kad::QueryResult::PutRecord(Err(error)) => {
+                    pending_rendezvous_publications.remove(&id);
+                    push_note(state, format!("rendezvous record publication failed: {error}")).await;
+                }
+                kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(peer_record))) => {
+                    if let Some(invite) = decode_rendezvous_record(&peer_record.record.value) {
+                        if let Some(lookup) = pending_rendezvous_lookups.get_mut(&id) {
+                            match lookup {
+                                PendingRendezvousLookup::PeerId(requested_peer_id) => {
+                                    if invite.peer_id == *requested_peer_id && !invite.addrs.is_empty() {
+                                        seed_rendezvous_invite(state, &invite).await;
+                                        let requested_peer_id = requested_peer_id.clone();
+                                        pending_rendezvous_lookups.remove(&id);
+                                        let ranked = {
+                                            let state = state.read().await;
+                                            resolve_ranked_dial_target(&state.network, &requested_peer_id)
+                                        };
+                                        match ranked.primary.parse::<Multiaddr>() {
+                                            Ok(multiaddr) => {
+                                                let _ = dial_ranked_target(
+                                                    state,
+                                                    swarm,
+                                                    pending_dials,
+                                                    ranked,
+                                                    multiaddr,
+                                                )
+                                                .await;
+                                            }
+                                            Err(_) => {
+                                                push_note(
+                                                    state,
+                                                    format!(
+                                                        "rendezvous resolved {requested_peer_id}, but no dialable address was produced"
+                                                    ),
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                    }
+                                }
+                                PendingRendezvousLookup::Room {
+                                    room_name,
+                                    resolved_peers,
+                                } => {
+                                    if !invite.addrs.is_empty()
+                                        && resolved_peers.insert(invite.peer_id.clone())
+                                    {
+                                        seed_rendezvous_invite(state, &invite).await;
+                                        let ranked = {
+                                            let state = state.read().await;
+                                            resolve_ranked_dial_target(&state.network, &invite.peer_id)
+                                        };
+                                        match ranked.primary.parse::<Multiaddr>() {
+                                            Ok(multiaddr) => {
+                                                let _ = dial_ranked_target(
+                                                    state,
+                                                    swarm,
+                                                    pending_dials,
+                                                    ranked,
+                                                    multiaddr,
+                                                )
+                                                .await;
+                                                push_note(
+                                                    state,
+                                                    format!(
+                                                        "room/invite code `{room_name}` resolved peer {}",
+                                                        invite.peer_id
+                                                    ),
+                                                )
+                                                .await;
+                                            }
+                                            Err(_) => {
+                                                push_note(
+                                                    state,
+                                                    format!(
+                                                        "room/invite code `{room_name}` resolved {}, but no dialable address was produced",
+                                                        invite.peer_id
+                                                    ),
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. })) => {
+                    if let Some(lookup) = pending_rendezvous_lookups.remove(&id) {
+                        match lookup {
+                            PendingRendezvousLookup::PeerId(requested_peer_id) => {
+                                push_note(
+                                    state,
+                                    format!("DHT rendezvous lookup for {requested_peer_id} finished without a usable record"),
+                                )
+                                .await;
+                            }
+                            PendingRendezvousLookup::Room {
+                                room_name,
+                                resolved_peers,
+                            } => {
+                                if resolved_peers.is_empty() {
+                                    push_note(
+                                        state,
+                                        format!("room/invite code `{room_name}` finished without any rendezvous matches"),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
+                kad::QueryResult::GetRecord(Err(error)) => {
+                    if let Some(lookup) = pending_rendezvous_lookups.remove(&id) {
+                        match lookup {
+                            PendingRendezvousLookup::PeerId(requested_peer_id) => {
+                                push_note(
+                                    state,
+                                    format!("DHT rendezvous lookup failed for {requested_peer_id}: {error}"),
+                                )
+                                .await;
+                            }
+                            PendingRendezvousLookup::Room { room_name, .. } => {
+                                push_note(
+                                    state,
+                                    format!("DHT rendezvous lookup failed for room/invite code `{room_name}`: {error}"),
+                                )
+                                .await;
+                            }
+                        }
+                    }
                 }
                 _ => {}
             },
@@ -1054,6 +1382,13 @@ async fn handle_swarm_event(
                 update_share_invite(&mut state);
                 insert_unique_note(&mut state, format!("UPnP mapped {rendered}"));
             }
+            maybe_publish_rendezvous_record(
+                state,
+                swarm,
+                pending_rendezvous_publications,
+                published_rendezvous_records,
+            )
+            .await;
             persist_network_snapshot(state, persistence).await;
         }
         SwarmEvent::Behaviour(VoicersBehaviourEvent::Upnp(upnp::Event::ExpiredExternalAddr(
@@ -1069,6 +1404,13 @@ async fn handle_swarm_event(
                 update_share_invite(&mut state);
                 insert_unique_note(&mut state, format!("UPnP mapping expired for {rendered}"));
             }
+            maybe_publish_rendezvous_record(
+                state,
+                swarm,
+                pending_rendezvous_publications,
+                published_rendezvous_records,
+            )
+            .await;
             persist_network_snapshot(state, persistence).await;
         }
         SwarmEvent::Behaviour(VoicersBehaviourEvent::Upnp(upnp::Event::GatewayNotFound)) => {
@@ -1092,30 +1434,28 @@ async fn handle_swarm_event(
                 channel,
                 ..
             } => {
-                apply_session_hello(state, peer.to_string(), hello.clone()).await;
-                persist_network_snapshot(state, persistence).await;
-                let _ = media.register_peer(peer.to_string()).await;
-
-                let response = {
-                    let state = state.read().await;
-                    SessionResponse::HelloAck(SessionHello {
-                        room_name: state.session.room_name.clone(),
-                        display_name: state.session.display_name.clone(),
-                    })
-                };
-
-                if let Err(response) = swarm
-                    .behaviour_mut()
-                    .session
-                    .send_response(channel, response)
-                {
-                    push_note(
+                if should_gate_peer_approval(state, &peer.to_string()).await {
+                    queue_pending_peer_approval(
                         state,
-                        format!("failed to send session response to {peer}: {response:?}"),
+                        pending_inbound_approvals,
+                        &peer.to_string(),
+                        hello,
+                        channel,
                     )
                     .await;
                 } else {
-                    push_note(state, format!("session hello received from {peer}")).await;
+                    apply_approved_session_hello(
+                        state,
+                        swarm,
+                        command_tx,
+                        active_media_flows,
+                        media,
+                        &peer.to_string(),
+                        hello.clone(),
+                        channel,
+                    )
+                    .await;
+                    persist_network_snapshot(state, persistence).await;
                 }
             }
             request_response::Message::Request {
@@ -1192,6 +1532,12 @@ async fn handle_swarm_event(
                     schedule_media_tick(command_tx.clone(), peer.to_string());
                     push_note(state, format!("media flow started for {peer}")).await;
                 }
+            }
+            request_response::Message::Response {
+                response: SessionResponse::JoinDenied { message },
+                ..
+            } => {
+                push_note(state, format!("join denied by {peer}: {message}")).await;
             }
             request_response::Message::Response {
                 response: SessionResponse::WebRtcSignalAck { signal_kind },
@@ -1409,6 +1755,173 @@ async fn send_session_hello(
     }
 }
 
+async fn should_gate_peer_approval(state: &Arc<RwLock<DaemonStatus>>, peer_id: &str) -> bool {
+    let state = state.read().await;
+    !state
+        .network
+        .known_peers
+        .iter()
+        .find(|peer| peer.peer_id == peer_id)
+        .map(|peer| peer.whitelisted)
+        .unwrap_or(false)
+}
+
+async fn is_peer_whitelisted(state: &Arc<RwLock<DaemonStatus>>, peer_id: &str) -> bool {
+    let state = state.read().await;
+    state
+        .network
+        .known_peers
+        .iter()
+        .find(|peer| peer.peer_id == peer_id)
+        .map(|peer| peer.whitelisted)
+        .unwrap_or(false)
+}
+
+async fn queue_pending_peer_approval(
+    state: &Arc<RwLock<DaemonStatus>>,
+    pending_inbound_approvals: &mut HashMap<String, PendingInboundApproval>,
+    peer_id: &str,
+    hello: SessionHello,
+    channel: request_response::ResponseChannel<SessionResponse>,
+) {
+    let (address, known) = {
+        let state = state.read().await;
+        let address = state
+            .peers
+            .iter()
+            .find(|peer| peer.peer_id == peer_id)
+            .map(|peer| peer.address.clone())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let known = state
+            .network
+            .known_peers
+            .iter()
+            .any(|peer| peer.peer_id == peer_id);
+        (address, known)
+    };
+    pending_inbound_approvals.insert(
+        peer_id.to_string(),
+        PendingInboundApproval {
+            hello: hello.clone(),
+            channel,
+        },
+    );
+    {
+        let mut state = state.write().await;
+        if !state
+            .pending_peer_approvals
+            .iter()
+            .any(|pending| pending.peer_id == peer_id)
+        {
+            state.pending_peer_approvals.push(voicers_core::PendingPeerApprovalSummary {
+                peer_id: peer_id.to_string(),
+                display_name: hello.display_name.clone(),
+                address,
+                room_name: hello.room_name.clone(),
+                known,
+            });
+        }
+    }
+    push_note(
+        state,
+        format!("peer {peer_id} is waiting for room approval"),
+    )
+    .await;
+}
+
+async fn apply_approved_session_hello(
+    state: &Arc<RwLock<DaemonStatus>>,
+    swarm: &mut libp2p::Swarm<VoicersBehaviour>,
+    command_tx: &mpsc::Sender<NetworkCommand>,
+    active_media_flows: &mut HashSet<String>,
+    media: &MediaHandle,
+    peer_id: &str,
+    hello: SessionHello,
+    channel: request_response::ResponseChannel<SessionResponse>,
+) {
+    apply_session_hello(state, peer_id.to_string(), hello.clone()).await;
+    let _ = media.register_peer(peer_id.to_string()).await;
+    let response = {
+        let state = state.read().await;
+        SessionResponse::HelloAck(SessionHello {
+            room_name: state.session.room_name.clone(),
+            display_name: state.session.display_name.clone(),
+        })
+    };
+    if let Err(response) = swarm.behaviour_mut().session.send_response(channel, response) {
+        push_note(
+            state,
+            format!("failed to send session response to {peer_id}: {response:?}"),
+        )
+        .await;
+    } else {
+        push_note(state, format!("session hello received from {peer_id}")).await;
+    }
+    if active_media_flows.insert(peer_id.to_string()) {
+        {
+            let mut state = state.write().await;
+            state.network.transport_stage =
+                "tcp+noise+yamux active; direct media transport active".to_string();
+            state
+                .pending_peer_approvals
+                .retain(|pending| pending.peer_id != peer_id);
+        }
+        select_media_path(state, media_transport::MediaPath::Libp2pRequestResponse).await;
+        schedule_media_tick(command_tx.clone(), peer_id.to_string());
+        push_note(state, format!("media flow started for {peer_id}")).await;
+    }
+}
+
+async fn approve_pending_peer(
+    state: &Arc<RwLock<DaemonStatus>>,
+    swarm: &mut libp2p::Swarm<VoicersBehaviour>,
+    command_tx: &mpsc::Sender<NetworkCommand>,
+    active_media_flows: &mut HashSet<String>,
+    pending_inbound_approvals: &mut HashMap<String, PendingInboundApproval>,
+    peer_id: &str,
+    media: &MediaHandle,
+) -> Result<String> {
+    let Some(pending) = pending_inbound_approvals.remove(peer_id) else {
+        anyhow::bail!("pending peer not found");
+    };
+    apply_approved_session_hello(
+        state,
+        swarm,
+        command_tx,
+        active_media_flows,
+        media,
+        peer_id,
+        pending.hello,
+        pending.channel,
+    )
+    .await;
+    Ok(format!("approved {peer_id}"))
+}
+
+async fn reject_pending_peer(
+    state: &Arc<RwLock<DaemonStatus>>,
+    swarm: &mut libp2p::Swarm<VoicersBehaviour>,
+    pending_inbound_approvals: &mut HashMap<String, PendingInboundApproval>,
+    peer_id: &str,
+) -> Result<String> {
+    let Some(pending) = pending_inbound_approvals.remove(peer_id) else {
+        anyhow::bail!("pending peer not found");
+    };
+    let _ = swarm.behaviour_mut().session.send_response(
+        pending.channel,
+        SessionResponse::JoinDenied {
+            message: "room join denied".to_string(),
+        },
+    );
+    {
+        let mut state = state.write().await;
+        state
+            .pending_peer_approvals
+            .retain(|pending| pending.peer_id != peer_id);
+    }
+    Ok(format!("rejected {peer_id}"))
+}
+
 async fn apply_session_hello(
     state: &Arc<RwLock<DaemonStatus>>,
     peer_id: String,
@@ -1486,6 +1999,196 @@ fn insert_unique_addr(addresses: &mut Vec<String>, address: String) {
     }
 }
 
+async fn dial_ranked_target(
+    state: &Arc<RwLock<DaemonStatus>>,
+    swarm: &mut libp2p::Swarm<VoicersBehaviour>,
+    pending_dials: &mut HashMap<String, PendingDial>,
+    ranked: media_transport::RankedDialTarget,
+    multiaddr: Multiaddr,
+) -> Result<String> {
+    swarm
+        .dial(multiaddr.clone())
+        .with_context(|| format!("failed to dial {multiaddr}"))?;
+    if let Some(peer_id) = ranked.peer_id {
+        pending_dials.insert(
+            peer_id,
+            PendingDial {
+                current_address: ranked.primary.clone(),
+                fallback_addresses: ranked.fallbacks.clone(),
+            },
+        );
+    }
+    if ranked.fallbacks.is_empty() {
+        push_note(state, format!("dialing {multiaddr}")).await;
+    } else {
+        push_note(
+            state,
+            format!(
+                "dialing {multiaddr}; ranked fallbacks: {}",
+                ranked.fallbacks.join(", ")
+            ),
+        )
+        .await;
+    }
+
+    Ok(format!("dialing {multiaddr}"))
+}
+
+fn rendezvous_record_key(peer_id: &str) -> String {
+    format!("{RENDEZVOUS_RECORD_PREFIX}{peer_id}")
+}
+
+fn room_rendezvous_record_key(room_name: &str) -> String {
+    format!("{RENDEZVOUS_RECORD_PREFIX}room/{}", room_name.trim())
+}
+
+fn current_rendezvous_invite(state: &DaemonStatus) -> Option<CompactInviteV1> {
+    if state.local_peer_id == "<starting>" || state.local_peer_id.is_empty() {
+        return None;
+    }
+
+    let addrs: Vec<String> = [
+        &state.network.external_addrs,
+        &state.network.observed_addrs,
+        &state.network.listen_addrs,
+    ]
+    .into_iter()
+    .flat_map(|addresses| addresses.iter())
+    .filter_map(|address| shareable_address(address, &state.local_peer_id))
+    .fold(Vec::new(), |mut acc, address| {
+        if !acc.contains(&address) {
+            acc.push(address);
+        }
+        acc
+    });
+
+    if addrs.is_empty() {
+        None
+    } else {
+        Some(CompactInviteV1 {
+            v: 1,
+            peer_id: state.local_peer_id.clone(),
+            addrs,
+            invite_code: state.session.invite_code.clone(),
+            expires_at_ms: state.session.invite_expires_at_ms,
+        })
+    }
+}
+
+fn current_rendezvous_records(state: &DaemonStatus) -> Vec<(String, CompactInviteV1)> {
+    let Some(invite) = current_rendezvous_invite(state) else {
+        return Vec::new();
+    };
+
+    let mut records = vec![(rendezvous_record_key(&invite.peer_id), invite.clone())];
+    if let Some(invite_code) = state.session.invite_code.as_deref() {
+        let invite_code = invite_code.trim();
+        if !invite_code.is_empty() {
+            records.push((room_rendezvous_record_key(invite_code), invite.clone()));
+        }
+    } else if let Some(room_name) = state.session.room_name.as_deref() {
+        let room_name = room_name.trim();
+        if !room_name.is_empty() && room_name != DEFAULT_ROOM_NAMESPACE {
+            records.push((room_rendezvous_record_key(room_name), invite));
+        }
+    }
+    records
+}
+
+fn decode_rendezvous_record(payload: &[u8]) -> Option<CompactInviteV1> {
+    let invite = serde_json::from_slice::<CompactInviteV1>(payload).ok()?;
+    if invite.v != 1 || invite.peer_id.trim().is_empty() {
+        return None;
+    }
+    Some(CompactInviteV1 {
+        v: invite.v,
+        peer_id: invite.peer_id.trim().to_string(),
+        addrs: invite
+            .addrs
+            .into_iter()
+            .map(|addr| addr.trim().to_string())
+            .filter(|addr| !addr.is_empty())
+            .collect(),
+        invite_code: invite
+            .invite_code
+            .map(|code| code.trim().to_string())
+            .filter(|code| !code.is_empty()),
+        expires_at_ms: invite.expires_at_ms,
+    })
+}
+
+async fn maybe_publish_rendezvous_record(
+    state: &Arc<RwLock<DaemonStatus>>,
+    swarm: &mut libp2p::Swarm<VoicersBehaviour>,
+    pending_rendezvous_publications: &mut HashMap<kad::QueryId, (String, Vec<u8>)>,
+    published_rendezvous_records: &mut HashMap<String, Vec<u8>>,
+) {
+    let state_snapshot = state.read().await;
+    let records = current_rendezvous_records(&state_snapshot);
+    drop(state_snapshot);
+
+    for (key, invite) in records {
+        let Ok(payload) = serde_json::to_vec(&invite) else {
+            continue;
+        };
+
+        if published_rendezvous_records
+            .get(&key)
+            .map(|current| current == &payload)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        if pending_rendezvous_publications
+            .values()
+            .any(|(pending_key, current)| pending_key == &key && current == &payload)
+        {
+            continue;
+        }
+
+        let record = kad::Record::new(key.clone().into_bytes(), payload.clone());
+        match swarm.behaviour_mut().kad.put_record(record, kad::Quorum::One) {
+            Ok(query_id) => {
+                pending_rendezvous_publications.insert(query_id, (key, payload));
+            }
+            Err(error) => {
+                push_note(
+                    state,
+                    format!("failed to queue rendezvous record publication: {error}"),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+async fn seed_rendezvous_invite(state: &Arc<RwLock<DaemonStatus>>, invite: &CompactInviteV1) {
+    let mut state = state.write().await;
+    state
+        .network
+        .ignored_peer_ids
+        .retain(|id| id != &invite.peer_id);
+    update_known_peer(&mut state, &invite.peer_id, None, None, false);
+    for address in &invite.addrs {
+        let normalized = shareable_address(address, &invite.peer_id)
+            .unwrap_or_else(|| address.trim().to_string());
+        if normalized.is_empty() {
+            continue;
+        }
+        insert_unique_addr(&mut state.network.saved_peer_addrs, normalized.clone());
+        if let Some(known_peer) = state
+            .network
+            .known_peers
+            .iter_mut()
+            .find(|peer| peer.peer_id == invite.peer_id)
+        {
+            insert_unique_addr(&mut known_peer.addresses, normalized.clone());
+            known_peer.last_dial_addr = Some(normalized.clone());
+        }
+    }
+}
+
 fn record_path_score(state: &mut DaemonStatus, path: &str, peer_id: Option<String>, success: bool) {
     let index = state
         .network
@@ -1517,7 +2220,7 @@ fn remove_addr(addresses: &mut Vec<String>, address: &str) {
 
 fn update_share_invite(state: &mut DaemonStatus) {
     state.network.share_invite =
-        best_share_invite(&state.local_peer_id, &state.network).or_else(|| {
+        best_share_invite(state).or_else(|| {
             state
                 .network
                 .share_invite
@@ -1564,6 +2267,7 @@ fn update_known_peer(
             last_dial_addr: None,
             connected,
             pinned: false,
+            whitelisted: false,
         });
         state
             .network
@@ -1582,23 +2286,34 @@ fn update_known_peer(
     entry.connected = connected;
 }
 
-fn best_share_invite(
-    local_peer_id: &str,
-    network: &voicers_core::NetworkSummary,
-) -> Option<String> {
-    [
+fn best_share_invite(state: &DaemonStatus) -> Option<String> {
+    let local_peer_id = &state.local_peer_id;
+    let network = &state.network;
+    let addrs: Vec<String> = [
         &network.external_addrs,
         &network.observed_addrs,
         &network.listen_addrs,
     ]
     .into_iter()
     .flat_map(|addresses| addresses.iter())
-    .filter_map(|address| compact_share_invite(address, local_peer_id))
-    .next()
-}
+    .filter_map(|address| shareable_address(address, local_peer_id))
+    .fold(Vec::new(), |mut acc, address| {
+        if !acc.contains(&address) {
+            acc.push(address);
+        }
+        acc
+    });
 
-fn compact_share_invite(address: &str, local_peer_id: &str) -> Option<String> {
-    shareable_address(address, local_peer_id).map(|address| encode_compact_invite(&address))
+    if addrs.is_empty() {
+        None
+    } else {
+        Some(encode_peer_compact_invite(
+            local_peer_id,
+            &addrs,
+            state.session.invite_code.as_deref(),
+            state.session.invite_expires_at_ms,
+        ))
+    }
 }
 
 fn shareable_address(address: &str, local_peer_id: &str) -> Option<String> {

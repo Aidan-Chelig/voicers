@@ -4,6 +4,24 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_CONTROL_ADDR: &str = "127.0.0.1:7767";
 pub const COMPACT_INVITE_PREFIX: &str = "voicers://join/";
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactInviteV1 {
+    pub v: u8,
+    pub peer_id: String,
+    #[serde(default)]
+    pub addrs: Vec<String>,
+    #[serde(default)]
+    pub invite_code: Option<String>,
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinTarget {
+    Raw(String),
+    Invite(CompactInviteV1),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub daemon_version: String,
@@ -13,6 +31,8 @@ pub struct DaemonStatus {
     pub network: NetworkSummary,
     pub audio: AudioSummary,
     pub peers: Vec<PeerSummary>,
+    #[serde(default)]
+    pub pending_peer_approvals: Vec<PendingPeerApprovalSummary>,
     pub notes: Vec<String>,
 }
 
@@ -21,6 +41,20 @@ pub struct SessionSummary {
     pub room_name: Option<String>,
     pub display_name: String,
     pub self_muted: bool,
+    #[serde(default)]
+    pub invite_code: Option<String>,
+    #[serde(default)]
+    pub invite_expires_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingPeerApprovalSummary {
+    pub peer_id: String,
+    pub display_name: String,
+    pub address: String,
+    pub room_name: Option<String>,
+    #[serde(default)]
+    pub known: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +105,8 @@ pub struct KnownPeerSummary {
     pub connected: bool,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub whitelisted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +327,7 @@ pub enum SessionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionResponse {
     HelloAck(SessionHello),
+    JoinDenied { message: String },
     WebRtcSignalAck { signal_kind: String },
 }
 
@@ -337,6 +374,14 @@ pub enum ControlRequest {
     ForgetKnownPeer {
         peer_id: String,
     },
+    ApprovePendingPeer {
+        peer_id: String,
+        whitelist: bool,
+    },
+    RejectPendingPeer {
+        peer_id: String,
+    },
+    RotateInviteCode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -355,6 +400,32 @@ pub fn encode_compact_invite(target: &str) -> String {
     format!("{COMPACT_INVITE_PREFIX}{encoded}")
 }
 
+pub fn encode_peer_compact_invite(
+    peer_id: &str,
+    addrs: &[String],
+    invite_code: Option<&str>,
+    expires_at_ms: Option<u64>,
+) -> String {
+    let payload = CompactInviteV1 {
+        v: 1,
+        peer_id: peer_id.trim().to_string(),
+        addrs: addrs
+            .iter()
+            .map(|addr| addr.trim())
+            .filter(|addr| !addr.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        invite_code: invite_code
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+            .map(ToOwned::to_owned),
+        expires_at_ms,
+    };
+    let encoded = serde_json::to_vec(&payload).expect("compact invite payload should serialize");
+    let encoded = URL_SAFE_NO_PAD.encode(encoded);
+    format!("{COMPACT_INVITE_PREFIX}{encoded}")
+}
+
 pub fn decode_compact_invite(invite: &str) -> Option<String> {
     let payload = invite.trim().strip_prefix(COMPACT_INVITE_PREFIX)?;
     let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
@@ -362,13 +433,53 @@ pub fn decode_compact_invite(invite: &str) -> Option<String> {
     Some(decoded.trim().to_string())
 }
 
+pub fn parse_join_target(value: &str) -> JoinTarget {
+    let trimmed = value.trim();
+    let Some(payload) = trimmed.strip_prefix(COMPACT_INVITE_PREFIX) else {
+        return JoinTarget::Raw(trimmed.to_string());
+    };
+
+    let Ok(decoded) = URL_SAFE_NO_PAD.decode(payload) else {
+        return JoinTarget::Raw(trimmed.to_string());
+    };
+
+    if let Ok(invite) = serde_json::from_slice::<CompactInviteV1>(&decoded) {
+        return JoinTarget::Invite(CompactInviteV1 {
+            v: invite.v,
+            peer_id: invite.peer_id.trim().to_string(),
+            addrs: invite
+                .addrs
+                .into_iter()
+                .map(|addr: String| addr.trim().to_string())
+                .filter(|addr: &String| !addr.is_empty())
+                .collect(),
+            invite_code: invite
+                .invite_code
+                .map(|code| code.trim().to_string())
+                .filter(|code| !code.is_empty()),
+            expires_at_ms: invite.expires_at_ms,
+        });
+    }
+
+    match String::from_utf8(decoded) {
+        Ok(decoded) => JoinTarget::Raw(decoded.trim().to_string()),
+        Err(_) => JoinTarget::Raw(trimmed.to_string()),
+    }
+}
+
 pub fn normalize_join_target(value: &str) -> String {
-    decode_compact_invite(value).unwrap_or_else(|| value.trim().to_string())
+    match parse_join_target(value) {
+        JoinTarget::Raw(target) => target,
+        JoinTarget::Invite(invite) => invite.peer_id,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_compact_invite, encode_compact_invite, normalize_join_target};
+    use super::{
+        decode_compact_invite, encode_compact_invite, encode_peer_compact_invite,
+        normalize_join_target, parse_join_target, CompactInviteV1, JoinTarget,
+    };
 
     #[test]
     fn compact_invite_round_trips_raw_multiaddr() {
@@ -383,5 +494,35 @@ mod tests {
     fn normalize_join_target_leaves_raw_inputs_unchanged() {
         let raw = "/ip4/198.51.100.10/tcp/4001/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb";
         assert_eq!(normalize_join_target(raw), raw);
+    }
+
+    #[test]
+    fn peer_invite_round_trips_structured_payload() {
+        let invite = encode_peer_compact_invite(
+            "12D3KooWExamplePeer",
+            &[
+                "/ip4/192.168.1.50/tcp/27015/p2p/12D3KooWExamplePeer".to_string(),
+                "/dns4/example.net/tcp/4001/p2p/12D3KooWExamplePeer".to_string(),
+            ],
+            Some("abc123"),
+            Some(123456789),
+        );
+        match parse_join_target(&invite) {
+            JoinTarget::Invite(CompactInviteV1 {
+                v,
+                peer_id,
+                addrs,
+                invite_code,
+                expires_at_ms,
+            }) => {
+                assert_eq!(v, 1);
+                assert_eq!(peer_id, "12D3KooWExamplePeer");
+                assert_eq!(addrs.len(), 2);
+                assert_eq!(invite_code.as_deref(), Some("abc123"));
+                assert_eq!(expires_at_ms, Some(123456789));
+            }
+            other => panic!("expected structured invite, got {other:?}"),
+        }
+        assert_eq!(normalize_join_target(&invite), "12D3KooWExamplePeer");
     }
 }

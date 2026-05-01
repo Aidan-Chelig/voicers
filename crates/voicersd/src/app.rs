@@ -1,11 +1,15 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Result;
 use tokio::sync::RwLock;
 use voicers_core::{
-    normalize_join_target, AudioBackend, AudioEngineStage, AudioSummary, ControlRequest,
-    ControlResponse, DaemonStatus, NetworkSummary, OutputStrategy, SessionHello, SessionSummary,
-    DEFAULT_CONTROL_ADDR,
+    parse_join_target, AudioBackend, AudioEngineStage, AudioSummary, CompactInviteV1,
+    ControlRequest, ControlResponse, DaemonStatus, JoinTarget, NetworkSummary, OutputStrategy,
+    SessionHello, SessionSummary, DEFAULT_CONTROL_ADDR,
 };
 
 #[cfg(feature = "webrtc-transport")]
@@ -87,6 +91,8 @@ impl App {
                 room_name: None,
                 display_name: initial_display_name,
                 self_muted: false,
+                invite_code: None,
+                invite_expires_at_ms: None,
             },
             network: NetworkSummary {
                 implementation: "libp2p".to_string(),
@@ -118,6 +124,7 @@ impl App {
                 input_gain_percent: 100,
             },
             peers: Vec::new(),
+            pending_peer_approvals: Vec::new(),
             notes: vec![
                 "Linux-first milestone: daemon owns per-peer logical buses.".to_string(),
                 "PipeWire node publication is planned after the transport and decode path."
@@ -210,7 +217,16 @@ impl App {
             ControlRequest::GetStatus => ControlResponse::Status(self.status().await),
             ControlRequest::CreateRoom { room_name } => {
                 let mut state = self.state.write().await;
-                state.session.room_name = Some(room_name.clone());
+                let normalized_room = room_name.trim().to_string();
+                state.session.room_name = Some(normalized_room.clone());
+                if normalized_room != "main" && !normalized_room.is_empty() {
+                    let (invite_code, expires_at_ms) = fresh_invite_code(&state.local_peer_id);
+                    state.session.invite_code = Some(invite_code);
+                    state.session.invite_expires_at_ms = Some(expires_at_ms);
+                } else {
+                    state.session.invite_code = None;
+                    state.session.invite_expires_at_ms = None;
+                }
                 let hello = SessionHello {
                     room_name: state.session.room_name.clone(),
                     display_name: state.session.display_name.clone(),
@@ -218,12 +234,23 @@ impl App {
                 drop(state);
                 let _ = self.network.broadcast_session_hello(hello).await;
                 ControlResponse::Ack {
-                    message: format!("room set to {room_name}"),
+                    message: format!("room set to {normalized_room}"),
                 }
             }
             ControlRequest::JoinPeer { address } => {
-                let address = normalize_join_target(&address);
-                match self.network.dial(address).await {
+                let dial_target = match parse_join_target(&address) {
+                    JoinTarget::Raw(target) => target,
+                    JoinTarget::Invite(invite) => {
+                        let code_target = invite
+                            .invite_code
+                            .clone()
+                            .filter(|_| invite.expires_at_ms.unwrap_or(u64::MAX) > now_ms());
+                        let peer_id = invite.peer_id.clone();
+                        self.seed_invite_hints(invite).await;
+                        code_target.unwrap_or(peer_id)
+                    }
+                };
+                match self.network.dial(dial_target).await {
                     Ok(message) => ControlResponse::Ack { message },
                     Err(error) => ControlResponse::Error {
                         message: error.to_string(),
@@ -394,6 +421,7 @@ impl App {
                                 voicers_core::PeerTransportState::Connected
                             ),
                             pinned: true,
+                            whitelisted: false,
                         });
                     live_peer.display_name
                 } else {
@@ -471,6 +499,75 @@ impl App {
                     message: "known peer forgotten".to_string(),
                 }
             }
+            ControlRequest::ApprovePendingPeer { peer_id, whitelist } => {
+                let response = self.network.approve_pending_peer(peer_id.clone()).await;
+                if response.is_ok() && whitelist {
+                    {
+                        let mut state = self.state.write().await;
+                        if let Some(peer) = state
+                            .network
+                            .known_peers
+                            .iter_mut()
+                            .find(|peer| peer.peer_id == peer_id)
+                        {
+                            peer.whitelisted = true;
+                        }
+                        state
+                            .pending_peer_approvals
+                            .retain(|pending| pending.peer_id != peer_id);
+                    }
+                    let _ = self.persist_state().await;
+                } else if response.is_ok() {
+                    let mut state = self.state.write().await;
+                    state
+                        .pending_peer_approvals
+                        .retain(|pending| pending.peer_id != peer_id);
+                }
+                match response {
+                    Ok(message) => ControlResponse::Ack { message: if whitelist {
+                        format!("{message}; peer whitelisted")
+                    } else {
+                        message
+                    }},
+                    Err(error) => ControlResponse::Error { message: error.to_string() },
+                }
+            }
+            ControlRequest::RejectPendingPeer { peer_id } => {
+                let response = self.network.reject_pending_peer(peer_id.clone()).await;
+                if response.is_ok() {
+                    let mut state = self.state.write().await;
+                    state
+                        .pending_peer_approvals
+                        .retain(|pending| pending.peer_id != peer_id);
+                }
+                match response {
+                    Ok(message) => ControlResponse::Ack { message },
+                    Err(error) => ControlResponse::Error { message: error.to_string() },
+                }
+            }
+            ControlRequest::RotateInviteCode => {
+                let mut state = self.state.write().await;
+                if state.session.room_name.as_deref() == Some("main")
+                    || state.session.room_name.as_deref().unwrap_or_default().is_empty()
+                {
+                    return ControlResponse::Error {
+                        message: "invite code rotation requires a custom room name".to_string(),
+                    };
+                }
+                let (invite_code, expires_at_ms) = fresh_invite_code(&state.local_peer_id);
+                state.session.invite_code = Some(invite_code.clone());
+                state.session.invite_expires_at_ms = Some(expires_at_ms);
+                let hello = SessionHello {
+                    room_name: state.session.room_name.clone(),
+                    display_name: state.session.display_name.clone(),
+                };
+                drop(state);
+                let _ = self.network.broadcast_session_hello(hello).await;
+                let _ = self.persist_state().await;
+                ControlResponse::Ack {
+                    message: format!("invite code rotated to {invite_code}"),
+                }
+            }
         }
     }
 
@@ -495,6 +592,52 @@ impl App {
             last_share_invite: state.network.share_invite.clone(),
             path_scores: state.network.path_scores.clone(),
         })
+    }
+
+    async fn seed_invite_hints(&self, invite: CompactInviteV1) {
+        let mut state = self.state.write().await;
+        state
+            .network
+            .ignored_peer_ids
+            .retain(|id| id != &invite.peer_id);
+
+        let peer_index = state
+            .network
+            .known_peers
+            .iter()
+            .position(|peer| peer.peer_id == invite.peer_id)
+            .unwrap_or_else(|| {
+                state.network.known_peers.push(voicers_core::KnownPeerSummary {
+                    peer_id: invite.peer_id.clone(),
+                    display_name: format!(
+                        "peer {}",
+                        invite.peer_id.get(0..12).unwrap_or(&invite.peer_id)
+                    ),
+                    addresses: Vec::new(),
+                    last_dial_addr: None,
+                    connected: false,
+                    pinned: false,
+                    whitelisted: false,
+                });
+                state.network.known_peers.len() - 1
+            });
+
+        for address in invite.addrs {
+            let address = address.trim().to_string();
+            if address.is_empty() {
+                continue;
+            }
+            if !state.network.saved_peer_addrs.contains(&address) {
+                state.network.saved_peer_addrs.push(address.clone());
+            }
+            let known_peer = &mut state.network.known_peers[peer_index];
+            if !known_peer.addresses.contains(&address) {
+                known_peer.addresses.push(address.clone());
+            }
+            if known_peer.last_dial_addr.is_none() {
+                known_peer.last_dial_addr = Some(address);
+            }
+        }
     }
 
     #[doc(hidden)]
@@ -526,4 +669,22 @@ impl App {
             },
         });
     }
+}
+
+fn fresh_invite_code(peer_id: &str) -> (String, u64) {
+    let now_ms = now_ms();
+    let expires_at_ms = now_ms.saturating_add(60 * 60 * 1000);
+    let seed = format!("{peer_id}:{now_ms}");
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    seed.hash(&mut hash);
+    let code = format!("{:08x}", hash.finish())[..8].to_ascii_lowercase();
+    (code, expires_at_ms)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
