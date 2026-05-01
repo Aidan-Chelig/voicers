@@ -209,8 +209,9 @@ async fn handle_peers_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
             app.set_flash(default_flash(Screen::Help));
         }
         KeyCode::Char('p') | KeyCode::Esc => {
-            app.screen = Screen::Rooms;
-            app.set_flash(default_flash(Screen::Rooms));
+            app.screen = Screen::Main;
+            app.clamp_main_selection();
+            app.set_flash(default_flash(Screen::Main));
         }
         KeyCode::Char('J') => {
             open_join_dialog(app);
@@ -296,7 +297,9 @@ async fn handle_rooms_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
             app.set_flash(default_flash(Screen::Help));
         }
         KeyCode::Char('r') | KeyCode::Esc => {
-            app.set_flash(default_flash(Screen::Rooms));
+            app.screen = Screen::Main;
+            app.clamp_main_selection();
+            app.set_flash(default_flash(Screen::Main));
         }
         KeyCode::Char('i') => {
             let invite = app
@@ -430,8 +433,9 @@ async fn handle_calls_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
             app.set_flash(default_flash(Screen::Help));
         }
         KeyCode::Char('l') | KeyCode::Esc => {
-            app.screen = Screen::Rooms;
-            app.set_flash(default_flash(Screen::Rooms));
+            app.screen = Screen::Main;
+            app.clamp_main_selection();
+            app.set_flash(default_flash(Screen::Main));
         }
         KeyCode::Char('J') => {
             open_join_dialog(app);
@@ -530,8 +534,9 @@ async fn handle_config_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
             app.set_flash(default_flash(Screen::Help));
         }
         KeyCode::Char('c') | KeyCode::Esc => {
-            app.screen = Screen::Rooms;
-            app.set_flash(default_flash(Screen::Rooms));
+            app.screen = Screen::Main;
+            app.clamp_main_selection();
+            app.set_flash(default_flash(Screen::Main));
         }
         KeyCode::Char('J') => {
             open_join_dialog(app);
@@ -600,8 +605,9 @@ async fn handle_known_peers_screen(app: &mut UiApp, key: KeyCode) -> Result<bool
             app.set_flash(default_flash(Screen::Help));
         }
         KeyCode::Char('o') | KeyCode::Esc => {
-            app.screen = Screen::Rooms;
-            app.set_flash(default_flash(Screen::Rooms));
+            app.screen = Screen::Main;
+            app.clamp_main_selection();
+            app.set_flash(default_flash(Screen::Main));
         }
         KeyCode::Char('J') => {
             open_join_dialog(app);
@@ -689,8 +695,9 @@ async fn handle_seen_users_screen(app: &mut UiApp, key: KeyCode) -> Result<bool>
             app.set_flash(default_flash(Screen::Help));
         }
         KeyCode::Char('v') | KeyCode::Esc => {
-            app.screen = Screen::Rooms;
-            app.set_flash(default_flash(Screen::Rooms));
+            app.screen = Screen::Main;
+            app.clamp_main_selection();
+            app.set_flash(default_flash(Screen::Main));
         }
         KeyCode::Char('J') => {
             open_join_dialog(app);
@@ -756,8 +763,9 @@ async fn handle_discovered_peers_screen(app: &mut UiApp, key: KeyCode) -> Result
             app.set_flash(default_flash(Screen::Help));
         }
         KeyCode::Char('t') | KeyCode::Esc => {
-            app.screen = Screen::Rooms;
-            app.set_flash(default_flash(Screen::Rooms));
+            app.screen = Screen::Main;
+            app.clamp_main_selection();
+            app.set_flash(default_flash(Screen::Main));
         }
         KeyCode::Char('J') => {
             open_join_dialog(app);
@@ -3527,7 +3535,7 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("j / k or arrows", "Move the selection."),
             ("x", "Mute or unmute the selected engaged user."),
             ("a", "Add the selected engaged user to Friends."),
-            ("p", "Return to Rooms."),
+            ("p / Esc", "Return to Main."),
             ("r / l / o / v / t / c", "Jump to Rooms, Calls, Friends, Seen Users, Network Peers, or Configuration."),
             ("g", "Refresh status immediately."),
         ],
@@ -3543,7 +3551,7 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("y / w / n", "Approve once, approve and whitelist, or reject a pending join."),
             ("m / u", "Toggle self mute or rename yourself."),
             ("Tab", "Edit the daemon control address."),
-            ("r", "Stay on Rooms."),
+            ("r / Esc", "Return to Main."),
             ("p / l / o / v / t", "Jump to Engaged Users, Calls, Friends, Seen Users, or Network Peers."),
             ("g", "Refresh status immediately."),
         ],
@@ -3555,7 +3563,7 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("x", "Mute or unmute the selected call user."),
             ("a", "Add the selected call user to Friends."),
             ("i", "Copy your direct-call invite to the clipboard."),
-            ("l", "Return to Rooms."),
+            ("l / Esc", "Return to Main."),
             ("p / r / o / v / t", "Jump to Engaged Users, Rooms, Friends, Seen Users, or Network Peers."),
             ("g", "Refresh status immediately."),
         ],
@@ -3567,7 +3575,7 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("h / l or arrows", "Lower or raise the selected value."),
             ("Enter", "Activate the selected capture device."),
             ("u", "Rename yourself."),
-            ("c", "Return to Rooms."),
+            ("c / Esc", "Return to Main."),
             ("p / r / l / o / v / t", "Jump to Engaged Users, Rooms, Calls, Friends, Seen Users, or Network Peers."),
             ("g", "Refresh status immediately."),
         ],
@@ -3579,7 +3587,7 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("Enter / d", "Reconnect to the selected friend."),
             ("e", "Rename the selected friend."),
             ("D", "Remove the selected friend from Friends."),
-            ("o", "Return to Rooms."),
+            ("o / Esc", "Return to Main."),
             ("p / r / l / v / t / c", "Jump to Engaged Users, Rooms, Calls, Seen Users, Network Peers, or Configuration."),
             ("g", "Refresh status immediately."),
         ],
@@ -3590,7 +3598,7 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("j / k or arrows", "Move the selection."),
             ("Enter / d", "Reconnect to the selected seen user."),
             ("a", "Add the selected seen user to Friends."),
-            ("v", "Return to Rooms."),
+            ("v / Esc", "Return to Main."),
             ("o / p / r / l / t / c", "Jump to Friends, Engaged Users, Rooms, Calls, Network Peers, or Configuration."),
             ("g", "Refresh status immediately."),
         ],
@@ -3600,7 +3608,7 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("J", "Open the join dialog and paste an invite code."),
             ("j / k or arrows", "Move the selection."),
             ("Enter / d", "Dial the selected routing candidate by peer id."),
-            ("t", "Return to Rooms."),
+            ("t / Esc", "Return to Main."),
             ("p / r / l / o / v / c", "Jump to Engaged Users, Rooms, Calls, Friends, Seen Users, or Configuration."),
             ("g", "Refresh status immediately."),
         ],
