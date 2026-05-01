@@ -6,12 +6,14 @@ use std::{
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use voicers_core::{KnownPeerSummary, NetworkSummary, PathScoreSummary};
+use voicers_core::{KnownPeerSummary, NetworkSummary, PathScoreSummary, RoomSummary};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistedState {
     #[serde(default)]
     pub local_display_name: Option<String>,
+    #[serde(default)]
+    pub rooms: Vec<RoomSummary>,
     #[serde(default)]
     pub known_peer_addrs: Vec<String>,
     #[serde(default)]
@@ -58,10 +60,11 @@ impl PersistenceHandle {
         let existing = self.load().unwrap_or_default();
         let state = PersistedState {
             local_display_name: existing.local_display_name,
+            rooms: existing.rooms,
             known_peer_addrs: network.saved_peer_addrs.clone(),
             known_peers: network.known_peers.clone(),
             ignored_peer_ids: network.ignored_peer_ids.clone(),
-            last_share_invite: network.share_invite.clone(),
+            last_share_invite: network.direct_call_invite.clone(),
             path_scores: network.path_scores.clone(),
         };
 

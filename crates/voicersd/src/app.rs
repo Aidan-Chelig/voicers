@@ -7,9 +7,10 @@ use std::{
 use anyhow::Result;
 use tokio::sync::RwLock;
 use voicers_core::{
-    parse_join_target, AudioBackend, AudioEngineStage, AudioSummary, CompactInviteV1,
-    ControlRequest, ControlResponse, DaemonStatus, JoinTarget, NetworkSummary, OutputStrategy,
-    SessionHello, SessionSummary, DEFAULT_CONTROL_ADDR,
+    parse_join_target, AudioBackend, AudioEngineStage, AudioSummary, CompactInviteKind,
+    CompactInviteV1, ControlRequest, ControlResponse, DaemonStatus, JoinTarget, NetworkSummary,
+    OutputStrategy, RoomInviteSummary, RoomMemberSummary, RoomPermission, RoomRoleSummary,
+    RoomSummary, SessionHello, SessionSummary, DEFAULT_CONTROL_ADDR,
 };
 
 #[cfg(feature = "webrtc-transport")]
@@ -78,10 +79,31 @@ impl App {
         let backend = AudioBackend::current();
         let persistence = PersistenceHandle::new(config.state_path.clone());
         let persisted = persistence.load().unwrap_or_default();
+        let mut network = NetworkSummary {
+            implementation: "libp2p".to_string(),
+            transport_stage: "starting libp2p swarm".to_string(),
+            nat_status: "detecting local reachability".to_string(),
+            listen_addrs: Vec::new(),
+            external_addrs: Vec::new(),
+            observed_addrs: Vec::new(),
+            stun_addrs: Vec::new(),
+            selected_media_path: "libp2p-request-response".to_string(),
+            webrtc_connection_state: "disabled".to_string(),
+            path_scores: persisted.path_scores,
+            saved_peer_addrs: persisted.known_peer_addrs,
+            known_peers: persisted.known_peers,
+            friends: Vec::new(),
+            seen_users: Vec::new(),
+            discovered_peers: Vec::new(),
+            ignored_peer_ids: persisted.ignored_peer_ids,
+            direct_call_invite: persisted.last_share_invite,
+        };
+        network.refresh_user_views();
         let initial_display_name = persisted
             .local_display_name
             .clone()
             .unwrap_or(config.display_name);
+        let rooms = persisted.rooms;
 
         let state = Arc::new(RwLock::new(DaemonStatus {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -91,25 +113,9 @@ impl App {
                 room_name: None,
                 display_name: initial_display_name,
                 self_muted: false,
-                invite_code: None,
-                invite_expires_at_ms: None,
             },
-            network: NetworkSummary {
-                implementation: "libp2p".to_string(),
-                transport_stage: "starting libp2p swarm".to_string(),
-                nat_status: "detecting local reachability".to_string(),
-                listen_addrs: Vec::new(),
-                external_addrs: Vec::new(),
-                observed_addrs: Vec::new(),
-                stun_addrs: Vec::new(),
-                selected_media_path: "libp2p-request-response".to_string(),
-                webrtc_connection_state: "disabled".to_string(),
-                path_scores: persisted.path_scores,
-                saved_peer_addrs: persisted.known_peer_addrs,
-                known_peers: persisted.known_peers,
-                ignored_peer_ids: persisted.ignored_peer_ids,
-                share_invite: persisted.last_share_invite,
-            },
+            rooms,
+            network,
             audio: AudioSummary {
                 output_strategy: OutputStrategy::for_backend(&backend),
                 backend,
@@ -195,6 +201,9 @@ impl App {
         {
             let mut state = state.write().await;
             state.local_peer_id = network.peer_id;
+            let local_peer_id = state.local_peer_id.clone();
+            let display_name = state.session.display_name.clone();
+            sync_local_room_memberships(&mut state.rooms, &local_peer_id, &display_name);
             #[cfg(feature = "webrtc-transport")]
             {
                 state.network.webrtc_connection_state = "idle".to_string();
@@ -218,15 +227,21 @@ impl App {
             ControlRequest::GetStatus => ControlResponse::Status(self.status().await),
             ControlRequest::CreateRoom { room_name } => {
                 let mut state = self.state.write().await;
-                let normalized_room = room_name.trim().to_string();
+                let normalized_room = normalize_room_name(&room_name);
+                let local_peer_id = state.local_peer_id.clone();
+                let display_name = state.session.display_name.clone();
+                engage_room(&mut state, &normalized_room, &local_peer_id, &display_name);
                 state.session.room_name = Some(normalized_room.clone());
                 if normalized_room != "main" && !normalized_room.is_empty() {
                     let (invite_code, expires_at_ms) = fresh_invite_code(&state.local_peer_id);
-                    state.session.invite_code = Some(invite_code);
-                    state.session.invite_expires_at_ms = Some(expires_at_ms);
+                    set_room_invite(
+                        &mut state,
+                        &normalized_room,
+                        invite_code.clone(),
+                        Some(expires_at_ms),
+                    );
                 } else {
-                    state.session.invite_code = None;
-                    state.session.invite_expires_at_ms = None;
+                    clear_room_invite(&mut state, &normalized_room);
                 }
                 let hello = SessionHello {
                     room_name: state.session.room_name.clone(),
@@ -234,6 +249,7 @@ impl App {
                 };
                 drop(state);
                 let _ = self.network.broadcast_session_hello(hello).await;
+                let _ = self.persist_state().await;
                 ControlResponse::Ack {
                     message: format!("room set to {normalized_room}"),
                 }
@@ -242,10 +258,14 @@ impl App {
                 let dial_target = match parse_join_target(&address) {
                     JoinTarget::Raw(target) => target,
                     JoinTarget::Invite(invite) => {
-                        let code_target = invite
-                            .invite_code
-                            .clone()
-                            .filter(|_| invite.expires_at_ms.unwrap_or(u64::MAX) > now_ms());
+                        let code_target = match invite.kind {
+                            CompactInviteKind::DirectCall => None,
+                            CompactInviteKind::Room => invite
+                                .invite_code
+                                .clone()
+                                .filter(|_| invite.expires_at_ms.unwrap_or(u64::MAX) > now_ms())
+                                .or_else(|| invite.room_name.clone()),
+                        };
                         let peer_id = invite.peer_id.clone();
                         self.seed_invite_hints(invite).await;
                         code_target.unwrap_or(peer_id)
@@ -298,6 +318,9 @@ impl App {
                 let hello = {
                     let mut state = self.state.write().await;
                     state.session.display_name = new_name.clone();
+                    let local_peer_id = state.local_peer_id.clone();
+                    let display_name = state.session.display_name.clone();
+                    sync_local_room_memberships(&mut state.rooms, &local_peer_id, &display_name);
                     SessionHello {
                         room_name: state.session.room_name.clone(),
                         display_name: state.session.display_name.clone(),
@@ -393,8 +416,16 @@ impl App {
                     .find(|peer| peer.peer_id == peer_id)
                 {
                     existing.pinned = true;
+                    existing.seen |= matches!(
+                        existing.connected,
+                        true
+                    ) && false;
                     if let Some(live_peer) = &live_peer {
                         existing.display_name = live_peer.display_name.clone();
+                        existing.seen |= matches!(
+                            live_peer.session,
+                            voicers_core::PeerSessionState::Active { .. }
+                        );
                         if !live_peer.address.is_empty() && live_peer.address != "<unknown>" {
                             if !existing.addresses.contains(&live_peer.address) {
                                 existing.addresses.push(live_peer.address.clone());
@@ -422,6 +453,10 @@ impl App {
                                 voicers_core::PeerTransportState::Connected
                             ),
                             pinned: true,
+                            seen: matches!(
+                                live_peer.session,
+                                voicers_core::PeerSessionState::Active { .. }
+                            ),
                             whitelisted: false,
                         });
                     live_peer.display_name
@@ -430,12 +465,14 @@ impl App {
                         message: "peer not found".to_string(),
                     };
                 };
+                state.network.refresh_user_views();
                 let snapshot = state.network.clone();
                 let local_display_name = state.session.display_name.clone();
+                let rooms = state.rooms.clone();
                 drop(state);
-                let _ = self.persist_network(local_display_name, snapshot);
+                let _ = self.persist_network(local_display_name, rooms, snapshot);
                 ControlResponse::Ack {
-                    message: format!("{known_peer} saved"),
+                    message: format!("{known_peer} added to friends"),
                 }
             }
             ControlRequest::RenameKnownPeer {
@@ -469,35 +506,40 @@ impl App {
                         message: "known peer not found".to_string(),
                     };
                 }
+                state.network.refresh_user_views();
                 let snapshot = state.network.clone();
                 let local_display_name = state.session.display_name.clone();
+                let rooms = state.rooms.clone();
                 drop(state);
-                let _ = self.persist_network(local_display_name, snapshot);
+                let _ = self.persist_network(local_display_name, rooms, snapshot);
                 ControlResponse::Ack {
-                    message: format!("peer renamed to {new_name}"),
+                    message: format!("friend renamed to {new_name}"),
                 }
             }
             ControlRequest::ForgetKnownPeer { peer_id } => {
                 let mut state = self.state.write().await;
-                let before = state.network.known_peers.len();
-                state
+                let Some(known_peer) = state
                     .network
                     .known_peers
-                    .retain(|peer| peer.peer_id != peer_id);
-                if before == state.network.known_peers.len() {
+                    .iter_mut()
+                    .find(|peer| peer.peer_id == peer_id)
+                else {
                     return ControlResponse::Error {
                         message: "known peer not found".to_string(),
                     };
-                }
+                };
+                known_peer.pinned = false;
+                state.network.refresh_user_views();
                 if !state.network.ignored_peer_ids.contains(&peer_id) {
                     state.network.ignored_peer_ids.push(peer_id);
                 }
                 let snapshot = state.network.clone();
                 let local_display_name = state.session.display_name.clone();
+                let rooms = state.rooms.clone();
                 drop(state);
-                let _ = self.persist_network(local_display_name, snapshot);
+                let _ = self.persist_network(local_display_name, rooms, snapshot);
                 ControlResponse::Ack {
-                    message: "known peer forgotten".to_string(),
+                    message: "friend removed".to_string(),
                 }
             }
             ControlRequest::ApprovePendingPeer { peer_id, whitelist } => {
@@ -513,6 +555,7 @@ impl App {
                         {
                             peer.whitelisted = true;
                         }
+                        state.network.refresh_user_views();
                         state
                             .pending_peer_approvals
                             .retain(|pending| pending.peer_id != peer_id);
@@ -552,12 +595,27 @@ impl App {
                     || state.session.room_name.as_deref().unwrap_or_default().is_empty()
                 {
                     return ControlResponse::Error {
-                        message: "invite code rotation requires a custom room name".to_string(),
+                        message: "room invite rotation requires a custom room name".to_string(),
+                    };
+                }
+                let current_room = state
+                    .session
+                    .room_name
+                    .clone()
+                    .unwrap_or_else(|| "main".to_string());
+                if !room_has_permission(&state, &current_room, &state.local_peer_id, RoomPermission::CreateRoomInvite)
+                {
+                    return ControlResponse::Error {
+                        message: "only room admins can create room invites".to_string(),
                     };
                 }
                 let (invite_code, expires_at_ms) = fresh_invite_code(&state.local_peer_id);
-                state.session.invite_code = Some(invite_code.clone());
-                state.session.invite_expires_at_ms = Some(expires_at_ms);
+                set_room_invite(
+                    &mut state,
+                    &current_room,
+                    invite_code.clone(),
+                    Some(expires_at_ms),
+                );
                 let hello = SessionHello {
                     room_name: state.session.room_name.clone(),
                     display_name: state.session.display_name.clone(),
@@ -566,19 +624,25 @@ impl App {
                 let _ = self.network.broadcast_session_hello(hello).await;
                 let _ = self.persist_state().await;
                 ControlResponse::Ack {
-                    message: format!("invite code rotated to {invite_code}"),
+                    message: format!("room invite rotated to {invite_code}"),
                 }
             }
         }
     }
 
-    fn persist_network(&self, local_display_name: String, network: NetworkSummary) -> Result<()> {
+    fn persist_network(
+        &self,
+        local_display_name: String,
+        rooms: Vec<RoomSummary>,
+        network: NetworkSummary,
+    ) -> Result<()> {
         self.persistence.save_full(&PersistedState {
             local_display_name: Some(local_display_name),
+            rooms,
             known_peer_addrs: network.saved_peer_addrs,
             known_peers: network.known_peers,
             ignored_peer_ids: network.ignored_peer_ids,
-            last_share_invite: network.share_invite,
+            last_share_invite: network.direct_call_invite,
             path_scores: network.path_scores,
         })
     }
@@ -587,10 +651,11 @@ impl App {
         let state = self.state.read().await;
         self.persistence.save_full(&PersistedState {
             local_display_name: Some(state.session.display_name.clone()),
+            rooms: state.rooms.clone(),
             known_peer_addrs: state.network.saved_peer_addrs.clone(),
             known_peers: state.network.known_peers.clone(),
             ignored_peer_ids: state.network.ignored_peer_ids.clone(),
-            last_share_invite: state.network.share_invite.clone(),
+            last_share_invite: state.network.direct_call_invite.clone(),
             path_scores: state.network.path_scores.clone(),
         })
     }
@@ -618,6 +683,7 @@ impl App {
                     last_dial_addr: None,
                     connected: false,
                     pinned: false,
+                    seen: false,
                     whitelisted: false,
                 });
                 state.network.known_peers.len() - 1
@@ -639,6 +705,7 @@ impl App {
                 known_peer.last_dial_addr = Some(address);
             }
         }
+        state.network.refresh_user_views();
     }
 
     #[doc(hidden)]
@@ -688,4 +755,149 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+fn normalize_room_name(room_name: &str) -> String {
+    let normalized = room_name.trim();
+    if normalized.is_empty() {
+        "main".to_string()
+    } else {
+        normalized.to_string()
+    }
+}
+
+fn engage_room(
+    state: &mut DaemonStatus,
+    room_name: &str,
+    local_peer_id: &str,
+    display_name: &str,
+) {
+    for room in &mut state.rooms {
+        room.engaged = room.name == room_name;
+    }
+
+    if let Some(room) = state.rooms.iter_mut().find(|room| room.name == room_name) {
+        room.engaged = true;
+        ensure_admin_role(room);
+        ensure_local_member(room, local_peer_id, display_name, true);
+        return;
+    }
+
+    let mut room = RoomSummary {
+        name: room_name.to_string(),
+        engaged: true,
+        roles: Vec::new(),
+        members: Vec::new(),
+        current_invite: None,
+    };
+    ensure_admin_role(&mut room);
+    ensure_local_member(&mut room, local_peer_id, display_name, true);
+    state.rooms.push(room);
+    state.rooms.sort_by(|left, right| left.name.cmp(&right.name));
+}
+
+fn set_room_invite(
+    state: &mut DaemonStatus,
+    room_name: &str,
+    invite_code: String,
+    expires_at_ms: Option<u64>,
+) {
+    if let Some(room) = state.rooms.iter_mut().find(|room| room.name == room_name) {
+        room.current_invite = Some(RoomInviteSummary {
+            invite_code,
+            share_invite: None,
+            expires_at_ms,
+            created_by_peer_id: Some(state.local_peer_id.clone()),
+        });
+    }
+}
+
+fn clear_room_invite(state: &mut DaemonStatus, room_name: &str) {
+    if let Some(room) = state.rooms.iter_mut().find(|room| room.name == room_name) {
+        room.current_invite = None;
+    }
+}
+
+fn room_has_permission(
+    state: &DaemonStatus,
+    room_name: &str,
+    peer_id: &str,
+    permission: RoomPermission,
+) -> bool {
+    let Some(room) = state.rooms.iter().find(|room| room.name == room_name) else {
+        return false;
+    };
+    let Some(member) = room.members.iter().find(|member| member.peer_id == peer_id) else {
+        return false;
+    };
+
+    member.roles.iter().any(|role_name| {
+        room.roles
+            .iter()
+            .find(|role| role.name == *role_name)
+            .map(|role| role.permissions.iter().any(|candidate| candidate == &permission))
+            .unwrap_or(false)
+    })
+}
+
+fn ensure_admin_role(room: &mut RoomSummary) {
+    if room.roles.iter().any(|role| role.name == "admin") {
+        return;
+    }
+
+    room.roles.push(RoomRoleSummary {
+        name: "admin".to_string(),
+        permissions: vec![
+            RoomPermission::CreateRoomInvite,
+            RoomPermission::CreateRole,
+            RoomPermission::EditRole,
+            RoomPermission::AssignRole,
+        ],
+    });
+}
+
+fn ensure_local_member(
+    room: &mut RoomSummary,
+    local_peer_id: &str,
+    display_name: &str,
+    seed_admin: bool,
+) {
+    let maybe_member = room
+        .members
+        .iter_mut()
+        .find(|member| member.peer_id == local_peer_id || member.peer_id.is_empty());
+
+    match maybe_member {
+        Some(member) => {
+            member.peer_id = local_peer_id.to_string();
+            member.display_name = display_name.to_string();
+            if seed_admin && !member.roles.iter().any(|role| role == "admin") {
+                member.roles.push("admin".to_string());
+            }
+        }
+        None => room.members.push(RoomMemberSummary {
+            peer_id: local_peer_id.to_string(),
+            display_name: display_name.to_string(),
+            roles: if seed_admin {
+                vec!["admin".to_string()]
+            } else {
+                Vec::new()
+            },
+        }),
+    }
+}
+
+fn sync_local_room_memberships(rooms: &mut [RoomSummary], local_peer_id: &str, display_name: &str) {
+    for room in rooms {
+        ensure_admin_role(room);
+        if room.engaged || room.members.iter().any(|member| member.peer_id == local_peer_id) {
+            ensure_local_member(room, local_peer_id, display_name, room.members.is_empty());
+        } else {
+            for member in &mut room.members {
+                if member.peer_id == local_peer_id {
+                    member.display_name = display_name.to_string();
+                }
+            }
+        }
+    }
 }

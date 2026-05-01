@@ -190,6 +190,7 @@ struct MediaPeerRuntime {
     decoded_frames: usize,
     phase_radians: f32,
     tone_hz: f32,
+    output_registered: bool,
 }
 
 struct CaptureChunk {
@@ -395,23 +396,6 @@ async fn run_media_engine(
                             eprintln!("media register error for {peer_id}: {error:#}");
                             continue;
                         }
-                        let (output_bus, display_name) = {
-                            let state = state.read().await;
-                            state
-                                .peers
-                                .iter()
-                                .find(|peer| peer.peer_id == peer_id)
-                                .map(|peer| (peer.output_bus.clone(), peer.display_name.clone()))
-                                .unwrap_or_else(|| {
-                                    (
-                                        format!("peer_bus_{}", short_peer_id(&peer_id)),
-                                        format!("peer {}", short_peer_id(&peer_id)),
-                                    )
-                                })
-                        };
-                        let _ = output_backend
-                            .register_peer_output(peer_id.clone(), output_bus, display_name)
-                            .await;
                         let mut state = state.write().await;
                         update_peer_media(&mut state, &peer_id, |media| {
                             media.stream_state = MediaStreamState::Primed;
@@ -633,6 +617,16 @@ async fn drive_playout(
             let rx_level_rms = rms_level(&pcm);
             last_rx_level_rms = Some(rx_level_rms);
             runtime.decoded_frames += 1;
+            if !runtime.output_registered {
+                let (output_bus, display_name) = peer_output_metadata(state, &peer_id).await;
+                if output_backend
+                    .register_peer_output(peer_id.clone(), output_bus, display_name)
+                    .await
+                    .is_ok()
+                {
+                    runtime.output_registered = true;
+                }
+            }
             let _ = output_backend.push_peer_pcm(peer_id.clone(), pcm).await;
         }
 
@@ -675,6 +669,7 @@ fn ensure_peer_runtime<'a>(
                 decoded_frames: 0,
                 phase_radians: 0.0,
                 tone_hz: TONE_BASE_HZ + peer_tone_offset(peer_id),
+                output_registered: false,
             },
         );
     }
@@ -682,6 +677,24 @@ fn ensure_peer_runtime<'a>(
     peers
         .get_mut(peer_id)
         .context("media runtime missing after insertion")
+}
+
+async fn peer_output_metadata(
+    state: &Arc<RwLock<DaemonStatus>>,
+    peer_id: &str,
+) -> (String, String) {
+    let state = state.read().await;
+    state
+        .peers
+        .iter()
+        .find(|peer| peer.peer_id == peer_id)
+        .map(|peer| (peer.output_bus.clone(), peer.display_name.clone()))
+        .unwrap_or_else(|| {
+            (
+                format!("peer_bus_{}", short_peer_id(peer_id)),
+                format!("peer {}", short_peer_id(peer_id)),
+            )
+        })
 }
 
 fn build_encoder() -> Result<Encoder> {

@@ -5,13 +5,29 @@ pub const DEFAULT_CONTROL_ADDR: &str = "127.0.0.1:7767";
 pub const COMPACT_INVITE_PREFIX: &str = "voicers://join/";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CompactInviteKind {
+    DirectCall,
+    Room,
+}
+
+impl Default for CompactInviteKind {
+    fn default() -> Self {
+        Self::DirectCall
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompactInviteV1 {
     pub v: u8,
+    #[serde(default)]
+    pub kind: CompactInviteKind,
     pub peer_id: String,
     #[serde(default)]
     pub addrs: Vec<String>,
     #[serde(default)]
     pub invite_code: Option<String>,
+    #[serde(default)]
+    pub room_name: Option<String>,
     #[serde(default)]
     pub expires_at_ms: Option<u64>,
 }
@@ -28,6 +44,8 @@ pub struct DaemonStatus {
     pub control_addr: String,
     pub local_peer_id: String,
     pub session: SessionSummary,
+    #[serde(default)]
+    pub rooms: Vec<RoomSummary>,
     pub network: NetworkSummary,
     pub audio: AudioSummary,
     pub peers: Vec<PeerSummary>,
@@ -41,10 +59,53 @@ pub struct SessionSummary {
     pub room_name: Option<String>,
     pub display_name: String,
     pub self_muted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomInviteSummary {
+    pub invite_code: String,
     #[serde(default)]
-    pub invite_code: Option<String>,
+    pub share_invite: Option<String>,
     #[serde(default)]
-    pub invite_expires_at_ms: Option<u64>,
+    pub expires_at_ms: Option<u64>,
+    #[serde(default)]
+    pub created_by_peer_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RoomPermission {
+    CreateRoomInvite,
+    CreateRole,
+    EditRole,
+    AssignRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomRoleSummary {
+    pub name: String,
+    #[serde(default)]
+    pub permissions: Vec<RoomPermission>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomMemberSummary {
+    pub peer_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub roles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomSummary {
+    pub name: String,
+    #[serde(default)]
+    pub engaged: bool,
+    #[serde(default)]
+    pub roles: Vec<RoomRoleSummary>,
+    #[serde(default)]
+    pub members: Vec<RoomMemberSummary>,
+    #[serde(default)]
+    pub current_invite: Option<RoomInviteSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,9 +142,16 @@ pub struct NetworkSummary {
     #[serde(default)]
     pub known_peers: Vec<KnownPeerSummary>,
     #[serde(default)]
+    pub friends: Vec<KnownPeerSummary>,
+    #[serde(default)]
+    pub seen_users: Vec<KnownPeerSummary>,
+    #[serde(default)]
+    pub discovered_peers: Vec<KnownPeerSummary>,
+    #[serde(default)]
     pub ignored_peer_ids: Vec<String>,
     #[serde(default)]
-    pub share_invite: Option<String>,
+    #[serde(alias = "share_invite")]
+    pub direct_call_invite: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,7 +174,27 @@ pub struct KnownPeerSummary {
     #[serde(default)]
     pub pinned: bool,
     #[serde(default)]
+    pub seen: bool,
+    #[serde(default)]
     pub whitelisted: bool,
+}
+
+impl NetworkSummary {
+    pub fn refresh_user_views(&mut self) {
+        self.friends.clear();
+        self.seen_users.clear();
+        self.discovered_peers.clear();
+
+        for peer in &self.known_peers {
+            if peer.pinned {
+                self.friends.push(peer.clone());
+            } else if peer.seen {
+                self.seen_users.push(peer.clone());
+            } else {
+                self.discovered_peers.push(peer.clone());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,6 +500,7 @@ pub fn encode_peer_compact_invite(
 ) -> String {
     let payload = CompactInviteV1 {
         v: 1,
+        kind: CompactInviteKind::DirectCall,
         peer_id: peer_id.trim().to_string(),
         addrs: addrs
             .iter()
@@ -423,6 +512,33 @@ pub fn encode_peer_compact_invite(
             .map(str::trim)
             .filter(|code| !code.is_empty())
             .map(ToOwned::to_owned),
+        room_name: None,
+        expires_at_ms,
+    };
+    let encoded = serde_json::to_vec(&payload).expect("compact invite payload should serialize");
+    let encoded = URL_SAFE_NO_PAD.encode(encoded);
+    format!("{COMPACT_INVITE_PREFIX}{encoded}")
+}
+
+pub fn encode_room_compact_invite(
+    peer_id: &str,
+    room_name: &str,
+    addrs: &[String],
+    invite_code: &str,
+    expires_at_ms: Option<u64>,
+) -> String {
+    let payload = CompactInviteV1 {
+        v: 1,
+        kind: CompactInviteKind::Room,
+        peer_id: peer_id.trim().to_string(),
+        addrs: addrs
+            .iter()
+            .map(|addr| addr.trim())
+            .filter(|addr| !addr.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        invite_code: Some(invite_code.trim().to_string()),
+        room_name: Some(room_name.trim().to_string()),
         expires_at_ms,
     };
     let encoded = serde_json::to_vec(&payload).expect("compact invite payload should serialize");
@@ -450,6 +566,7 @@ pub fn parse_join_target(value: &str) -> JoinTarget {
     if let Ok(invite) = serde_json::from_slice::<CompactInviteV1>(&decoded) {
         return JoinTarget::Invite(CompactInviteV1 {
             v: invite.v,
+            kind: invite.kind,
             peer_id: invite.peer_id.trim().to_string(),
             addrs: invite
                 .addrs
@@ -461,6 +578,10 @@ pub fn parse_join_target(value: &str) -> JoinTarget {
                 .invite_code
                 .map(|code| code.trim().to_string())
                 .filter(|code| !code.is_empty()),
+            room_name: invite
+                .room_name
+                .map(|room_name| room_name.trim().to_string())
+                .filter(|room_name| !room_name.is_empty()),
             expires_at_ms: invite.expires_at_ms,
         });
     }
@@ -474,7 +595,13 @@ pub fn parse_join_target(value: &str) -> JoinTarget {
 pub fn normalize_join_target(value: &str) -> String {
     match parse_join_target(value) {
         JoinTarget::Raw(target) => target,
-        JoinTarget::Invite(invite) => invite.peer_id,
+        JoinTarget::Invite(invite) => match invite.kind {
+            CompactInviteKind::DirectCall => invite.peer_id,
+            CompactInviteKind::Room => invite
+                .invite_code
+                .or(invite.room_name)
+                .unwrap_or(invite.peer_id),
+        },
     }
 }
 
@@ -482,8 +609,8 @@ pub fn normalize_join_target(value: &str) -> String {
 mod tests {
     use super::{
         decode_compact_invite, encode_compact_invite, encode_join_namespace_invite,
-        encode_peer_compact_invite, normalize_join_target, parse_join_target, CompactInviteV1,
-        JoinTarget,
+        encode_peer_compact_invite, encode_room_compact_invite, normalize_join_target,
+        parse_join_target, CompactInviteKind, CompactInviteV1, JoinTarget,
     };
 
     #[test]
@@ -515,20 +642,51 @@ mod tests {
         match parse_join_target(&invite) {
             JoinTarget::Invite(CompactInviteV1 {
                 v,
+                kind,
                 peer_id,
                 addrs,
                 invite_code,
+                room_name,
                 expires_at_ms,
             }) => {
                 assert_eq!(v, 1);
+                assert_eq!(kind, CompactInviteKind::DirectCall);
                 assert_eq!(peer_id, "12D3KooWExamplePeer");
                 assert_eq!(addrs.len(), 2);
                 assert_eq!(invite_code.as_deref(), Some("abc123"));
+                assert_eq!(room_name, None);
                 assert_eq!(expires_at_ms, Some(123456789));
             }
             other => panic!("expected structured invite, got {other:?}"),
         }
         assert_eq!(normalize_join_target(&invite), "12D3KooWExamplePeer");
+    }
+
+    #[test]
+    fn room_invite_round_trips_structured_payload() {
+        let invite = encode_room_compact_invite(
+            "12D3KooWExamplePeer",
+            "alpha-room",
+            &["/ip4/192.168.1.50/tcp/27015/p2p/12D3KooWExamplePeer".to_string()],
+            "room123",
+            Some(123456789),
+        );
+        match parse_join_target(&invite) {
+            JoinTarget::Invite(CompactInviteV1 {
+                kind,
+                peer_id,
+                invite_code,
+                room_name,
+                ..
+            }) => {
+                assert_eq!(kind, CompactInviteKind::Room);
+                assert_eq!(peer_id, "12D3KooWExamplePeer");
+                assert_eq!(invite_code.as_deref(), Some("room123"));
+                assert_eq!(room_name.as_deref(), Some("alpha-room"));
+            }
+            other => panic!("expected structured invite, got {other:?}"),
+        }
+        assert_eq!(normalize_join_target(&invite), "room123");
     }
 
     #[test]

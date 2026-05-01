@@ -395,9 +395,8 @@ mod tests {
                 room_name: None,
                 display_name: "local".to_string(),
                 self_muted: false,
-                invite_code: None,
-                invite_expires_at_ms: None,
             },
+            rooms: Vec::new(),
             network: NetworkSummary {
                 implementation: "libp2p".to_string(),
                 transport_stage: "testing".to_string(),
@@ -411,8 +410,11 @@ mod tests {
                 path_scores: Vec::new(),
                 saved_peer_addrs: Vec::new(),
                 known_peers: Vec::new(),
+                friends: Vec::new(),
+                seen_users: Vec::new(),
+                discovered_peers: Vec::new(),
                 ignored_peer_ids: Vec::new(),
-                share_invite: None,
+                direct_call_invite: None,
             },
             audio: AudioSummary {
                 backend: AudioBackend::Unknown,
@@ -467,6 +469,7 @@ mod tests {
             )),
             connected: false,
             pinned: true,
+            seen: true,
             whitelisted: false,
         });
         status
@@ -508,6 +511,7 @@ mod tests {
             last_dial_addr: None,
             connected: false,
             pinned: true,
+            seen: true,
             whitelisted: false,
         });
 
@@ -532,9 +536,8 @@ mod tests {
                 room_name: None,
                 display_name: "local".to_string(),
                 self_muted: false,
-                invite_code: None,
-                invite_expires_at_ms: None,
             },
+            rooms: Vec::new(),
             network: NetworkSummary {
                 implementation: "libp2p".to_string(),
                 transport_stage: "testing".to_string(),
@@ -548,8 +551,11 @@ mod tests {
                 path_scores: Vec::new(),
                 saved_peer_addrs: Vec::new(),
                 known_peers: Vec::new(),
+                friends: Vec::new(),
+                seen_users: Vec::new(),
+                discovered_peers: Vec::new(),
                 ignored_peer_ids: Vec::new(),
-                share_invite: None,
+                direct_call_invite: None,
             },
             audio: AudioSummary {
                 backend: AudioBackend::Unknown,

@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use voicers_core::{DaemonStatus, KnownPeerSummary, PeerSessionState, PeerSummary};
+use voicers_core::{DaemonStatus, KnownPeerSummary, PeerSessionState, PeerSummary, RoomSummary};
 
 pub struct UiApp {
     pub control_addr: String,
@@ -20,6 +20,10 @@ pub struct UiApp {
     pub selected_peer: usize,
     pub selected_config_item: usize,
     pub selected_known_peer: usize,
+    pub selected_seen_user: usize,
+    pub selected_discovered_peer: usize,
+    pub selected_room: usize,
+    pub selected_call: usize,
     pub daemon_launch: DaemonLaunchState,
     pub default_room_initialized: bool,
 }
@@ -39,8 +43,13 @@ pub enum InputMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Main,
+    Peers,
+    Rooms,
+    Calls,
     Config,
     KnownPeers,
+    SeenUsers,
+    DiscoveredPeers,
     Help,
 }
 
@@ -51,6 +60,13 @@ pub struct FallbackCandidatePreview {
     pub successes: u64,
     pub failures: u64,
     pub is_last_dial: bool,
+}
+
+pub struct KnownRoomPreview {
+    pub name: String,
+    pub engaged_users: usize,
+    pub pending_approvals: usize,
+    pub is_current: bool,
 }
 
 pub enum ConfigItem {
@@ -87,6 +103,10 @@ impl UiApp {
             selected_peer: 0,
             selected_config_item: 0,
             selected_known_peer: 0,
+            selected_seen_user: 0,
+            selected_discovered_peer: 0,
+            selected_room: 0,
+            selected_call: 0,
             daemon_launch: DaemonLaunchState::default(),
             default_room_initialized: false,
         }
@@ -104,12 +124,34 @@ impl UiApp {
             .copied()
     }
 
+    pub fn selected_call_peer(&self) -> Option<&PeerSummary> {
+        active_call_peers(self.status.as_ref()?)
+            .get(self.selected_call)
+            .copied()
+    }
+
     pub fn selected_known_peer(&self) -> Option<&KnownPeerSummary> {
         self.status
             .as_ref()?
             .network
-            .known_peers
+            .friends
             .get(self.selected_known_peer)
+    }
+
+    pub fn selected_seen_user(&self) -> Option<&KnownPeerSummary> {
+        self.status
+            .as_ref()?
+            .network
+            .seen_users
+            .get(self.selected_seen_user)
+    }
+
+    pub fn selected_discovered_peer(&self) -> Option<&KnownPeerSummary> {
+        self.status
+            .as_ref()?
+            .network
+            .discovered_peers
+            .get(self.selected_discovered_peer)
     }
 
     pub fn clamp_selection(&mut self) {
@@ -134,16 +176,68 @@ impl UiApp {
         }
     }
 
+    pub fn clamp_room_selection(&mut self) {
+        let len = self
+            .status
+            .as_ref()
+            .map(|status| known_rooms(status).len())
+            .unwrap_or(0);
+        if len == 0 {
+            self.selected_room = 0;
+        } else if self.selected_room >= len {
+            self.selected_room = len - 1;
+        }
+    }
+
+    pub fn clamp_call_selection(&mut self) {
+        let len = self
+            .status
+            .as_ref()
+            .map(|status| active_call_peers(status).len())
+            .unwrap_or(0);
+        if len == 0 {
+            self.selected_call = 0;
+        } else if self.selected_call >= len {
+            self.selected_call = len - 1;
+        }
+    }
+
     pub fn clamp_known_peer_selection(&mut self) {
         let len = self
             .status
             .as_ref()
-            .map(|status| status.network.known_peers.len())
+            .map(|status| status.network.friends.len())
             .unwrap_or(0);
         if len == 0 {
             self.selected_known_peer = 0;
         } else if self.selected_known_peer >= len {
             self.selected_known_peer = len - 1;
+        }
+    }
+
+    pub fn clamp_seen_user_selection(&mut self) {
+        let len = self
+            .status
+            .as_ref()
+            .map(|status| status.network.seen_users.len())
+            .unwrap_or(0);
+        if len == 0 {
+            self.selected_seen_user = 0;
+        } else if self.selected_seen_user >= len {
+            self.selected_seen_user = len - 1;
+        }
+    }
+
+    pub fn clamp_discovered_peer_selection(&mut self) {
+        let len = self
+            .status
+            .as_ref()
+            .map(|status| status.network.discovered_peers.len())
+            .unwrap_or(0);
+        if len == 0 {
+            self.selected_discovered_peer = 0;
+        } else if self.selected_discovered_peer >= len {
+            self.selected_discovered_peer = len - 1;
         }
     }
 
@@ -201,16 +295,110 @@ pub fn visible_voice_peers(status: &DaemonStatus) -> Vec<&PeerSummary> {
 
 pub fn default_flash(screen: Screen) -> &'static str {
     match screen {
-        Screen::Main => {
-            "q quit | ? help | enter or d join | i show invite | C rotate code | y allow | w whitelist | n reject | m mute | p peers | c config"
-        }
-        Screen::Config => {
-            "q quit | ? help | c back | p peers | u rename self | enter select device | hjkl or arrows navigate"
-        }
-        Screen::KnownPeers => {
-            "q quit | ? help | p back | c config | a save | n rename peer | D forget | enter or d reconnect"
-        }
-        Screen::Help => "q quit | ? or esc back | review local testing and fallback diagnostics",
+        Screen::Main => "rooms | ? keybinds | J join invite | Enter enter room",
+        Screen::Peers => "engaged users | ? keybinds | x mute | a add friend",
+        Screen::Rooms => "rooms | ? keybinds | J join invite | Enter enter room",
+        Screen::Calls => "calls | ? keybinds | x mute | a add friend",
+        Screen::Config => "configuration | ? keybinds | h/l adjust | Enter activate",
+        Screen::KnownPeers => "friends | ? keybinds | Enter reconnect | D remove",
+        Screen::SeenUsers => "seen users | ? keybinds | Enter reconnect | a add friend",
+        Screen::DiscoveredPeers => "network peers | ? keybinds | Enter inspect route candidate",
+        Screen::Help => "? or esc closes help",
+    }
+}
+
+pub fn active_call_peers(status: &DaemonStatus) -> Vec<&PeerSummary> {
+    let current_room = status.session.room_name.as_deref().unwrap_or("main");
+    status
+        .peers
+        .iter()
+        .filter(|peer| {
+            matches!(
+                &peer.session,
+                PeerSessionState::Active { room_name, .. }
+                    if room_name.as_deref().unwrap_or("main") != current_room
+            )
+        })
+        .collect()
+}
+
+pub fn known_rooms(status: &DaemonStatus) -> Vec<KnownRoomPreview> {
+    let current_room = status.session.room_name.as_deref().unwrap_or("main");
+    let mut rooms = room_seed_list(status, current_room);
+
+    for peer in visible_voice_peers(status) {
+        let room_name = match &peer.session {
+            PeerSessionState::Active { room_name, .. } => {
+                room_name.clone().unwrap_or_else(|| "main".to_string())
+            }
+            PeerSessionState::None | PeerSessionState::Handshaking => continue,
+        };
+        upsert_room(&mut rooms, &room_name, room_name == current_room, true, false);
+    }
+
+    for pending in &status.pending_peer_approvals {
+        let room_name = pending
+            .room_name
+            .clone()
+            .unwrap_or_else(|| "main".to_string());
+        upsert_room(&mut rooms, &room_name, room_name == current_room, false, true);
+    }
+
+    rooms.sort_by(|left, right| {
+        right
+            .is_current
+            .cmp(&left.is_current)
+            .then_with(|| right.engaged_users.cmp(&left.engaged_users))
+            .then_with(|| right.pending_approvals.cmp(&left.pending_approvals))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    rooms
+}
+
+fn room_seed_list(status: &DaemonStatus, current_room: &str) -> Vec<KnownRoomPreview> {
+    if status.rooms.is_empty() {
+        return vec![KnownRoomPreview {
+            name: current_room.to_string(),
+            engaged_users: 0,
+            pending_approvals: 0,
+            is_current: true,
+        }];
+    }
+
+    status
+        .rooms
+        .iter()
+        .map(|room| seeded_room_preview(room, current_room))
+        .collect()
+}
+
+fn seeded_room_preview(room: &RoomSummary, current_room: &str) -> KnownRoomPreview {
+    KnownRoomPreview {
+        name: room.name.clone(),
+        engaged_users: 0,
+        pending_approvals: 0,
+        is_current: room.engaged || room.name == current_room,
+    }
+}
+
+fn upsert_room(
+    rooms: &mut Vec<KnownRoomPreview>,
+    room_name: &str,
+    is_current: bool,
+    engaged_user: bool,
+    pending_approval: bool,
+) {
+    if let Some(room) = rooms.iter_mut().find(|room| room.name == room_name) {
+        room.is_current |= is_current;
+        room.engaged_users += usize::from(engaged_user);
+        room.pending_approvals += usize::from(pending_approval);
+    } else {
+        rooms.push(KnownRoomPreview {
+            name: room_name.to_string(),
+            engaged_users: usize::from(engaged_user),
+            pending_approvals: usize::from(pending_approval),
+            is_current,
+        });
     }
 }
 
@@ -263,20 +451,6 @@ pub fn ranked_fallback_candidates(
             }
         })
         .collect()
-}
-
-pub fn local_fallback_test_steps(control_addr: &str) -> Vec<String> {
-    let secondary =
-        sibling_control_addr(control_addr).unwrap_or_else(|| "127.0.0.1:7768".to_string());
-    vec![
-        "1. Build once: cargo build -p voicersd -p voicers".to_string(),
-        format!("2. Run Alice at `{control_addr}` on `/ip4/127.0.0.1/tcp/4001`."),
-        format!("3. Run Bob at `{secondary}` on `/ip4/127.0.0.1/tcp/4002`."),
-        "4. Dial Alice once, then save her in Bob's Known Peers screen.".to_string(),
-        "5. Restart Alice on `/ip4/127.0.0.1/tcp/4011`.".to_string(),
-        "6. Update Bob's saved addresses so Alice has both `4001` and `4011`, with `last_dial_addr` still on `4001`.".to_string(),
-        "7. Reconnect from Known Peers. The daemon should fail the stale address and retry the next ranked address automatically.".to_string(),
-    ]
 }
 
 pub fn parse_ui_config(default_control_addr: &str) -> UiConfig {
@@ -376,17 +550,12 @@ fn address_path_label(address: &str) -> &'static str {
     }
 }
 
-fn sibling_control_addr(control_addr: &str) -> Option<String> {
-    let socket_addr = control_addr.parse::<std::net::SocketAddr>().ok()?;
-    Some(format!("{}:{}", socket_addr.ip(), socket_addr.port() + 1))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use voicers_core::{
         AudioBackend, AudioEngineStage, AudioSummary, NetworkSummary, OutputStrategy,
-        PathScoreSummary, SessionSummary,
+        PathScoreSummary, RoomSummary, SessionSummary,
     };
 
     #[test]
@@ -419,10 +588,12 @@ mod tests {
                 )),
                 connected: false,
                 pinned: true,
+                seen: true,
+                whitelisted: false,
             }],
         );
 
-        let ranked = ranked_fallback_candidates(&status, &status.network.known_peers[0]);
+        let ranked = ranked_fallback_candidates(&status, &status.network.friends[0]);
         assert_eq!(ranked[0].path_label, "libp2p-direct");
         assert_eq!(ranked[1].path_label, "libp2p-relay");
     }
@@ -440,19 +611,78 @@ mod tests {
                 last_dial_addr: Some(address.clone()),
                 connected: false,
                 pinned: true,
+                seen: true,
+                whitelisted: false,
             }],
         );
 
-        let ranked = ranked_fallback_candidates(&status, &status.network.known_peers[0]);
+        let ranked = ranked_fallback_candidates(&status, &status.network.friends[0]);
         assert_eq!(ranked.len(), 1);
         assert!(ranked[0].is_last_dial);
+    }
+
+    #[test]
+    fn known_rooms_are_seeded_from_durable_room_state() {
+        let mut status = test_status(Vec::new(), Vec::new());
+        status.session.room_name = Some("alpha".to_string());
+        status.rooms = vec![
+            RoomSummary {
+                name: "alpha".to_string(),
+                engaged: true,
+                roles: Vec::new(),
+                members: Vec::new(),
+                current_invite: None,
+            },
+            RoomSummary {
+                name: "beta".to_string(),
+                engaged: false,
+                roles: Vec::new(),
+                members: Vec::new(),
+                current_invite: None,
+            },
+        ];
+        status.peers.push(PeerSummary {
+            peer_id: "peer-a".to_string(),
+            display_name: "Peer A".to_string(),
+            address: "<unknown>".to_string(),
+            muted: false,
+            output_volume_percent: 100,
+            output_bus: "peer_bus_01".to_string(),
+            transport: voicers_core::PeerTransportState::Connected,
+            session: PeerSessionState::Active {
+                room_name: Some("beta".to_string()),
+                display_name: "Peer A".to_string(),
+            },
+            media: voicers_core::PeerMediaState {
+                stream_state: voicers_core::MediaStreamState::Idle,
+                sent_packets: 0,
+                received_packets: 0,
+                tx_level_rms: 0.0,
+                rx_level_rms: 0.0,
+                lost_packets: 0,
+                late_packets: 0,
+                concealed_frames: 0,
+                drift_corrections: 0,
+                queued_packets: 0,
+                decoded_frames: 0,
+                queued_samples: 0,
+                last_sequence: None,
+            },
+        });
+
+        let rooms = known_rooms(&status);
+        assert_eq!(rooms.len(), 2);
+        assert_eq!(rooms[0].name, "alpha");
+        assert!(rooms[0].is_current);
+        assert_eq!(rooms[1].name, "beta");
+        assert_eq!(rooms[1].engaged_users, 1);
     }
 
     fn test_status(
         path_scores: Vec<PathScoreSummary>,
         known_peers: Vec<KnownPeerSummary>,
     ) -> DaemonStatus {
-        DaemonStatus {
+        let mut status = DaemonStatus {
             daemon_version: "0.1.0".to_string(),
             control_addr: "127.0.0.1:7767".to_string(),
             local_peer_id: "local".to_string(),
@@ -461,6 +691,7 @@ mod tests {
                 display_name: "local".to_string(),
                 self_muted: false,
             },
+            rooms: Vec::new(),
             network: NetworkSummary {
                 implementation: "libp2p".to_string(),
                 transport_stage: "testing".to_string(),
@@ -474,8 +705,11 @@ mod tests {
                 path_scores,
                 saved_peer_addrs: Vec::new(),
                 known_peers,
+                friends: Vec::new(),
+                seen_users: Vec::new(),
+                discovered_peers: Vec::new(),
                 ignored_peer_ids: Vec::new(),
-                share_invite: None,
+                direct_call_invite: None,
             },
             audio: AudioSummary {
                 backend: AudioBackend::Unknown,
@@ -491,7 +725,10 @@ mod tests {
                 input_gain_percent: 100,
             },
             peers: Vec::new(),
+            pending_peer_approvals: Vec::new(),
             notes: Vec::new(),
-        }
+        };
+        status.network.refresh_user_views();
+        status
     }
 }

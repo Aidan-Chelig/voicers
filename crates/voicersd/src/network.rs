@@ -19,9 +19,10 @@ use libp2p::{
 use serde_json;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use voicers_core::{
-    encode_peer_compact_invite, CompactInviteV1, DaemonStatus, KnownPeerSummary, MediaRequest,
-    MediaResponse, MediaStreamState, PathScoreSummary, PeerMediaState, PeerSessionState,
-    PeerSummary, PeerTransportState, SessionHello, SessionRequest, SessionResponse, WebRtcSignal,
+    encode_peer_compact_invite, encode_room_compact_invite, CompactInviteKind, CompactInviteV1,
+    DaemonStatus, KnownPeerSummary, MediaRequest, MediaResponse, MediaStreamState,
+    PathScoreSummary, PeerMediaState, PeerSessionState, PeerSummary, PeerTransportState,
+    SessionHello, SessionRequest, SessionResponse, WebRtcSignal,
 };
 
 use std::sync::Arc;
@@ -60,6 +61,7 @@ const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun1.l.google.com:19302",
     "stun.cloudflare.com:3478",
 ];
+const MAX_SHARE_INVITE_ADDRS: usize = 4;
 fn relay_reservation_addr(mut relay_addr: Multiaddr) -> Result<Multiaddr> {
     let has_relay_peer = relay_addr
         .iter()
@@ -1147,6 +1149,7 @@ async fn handle_swarm_event(
                         None,
                         Some(identified_peer.1.clone()),
                         true,
+                        false,
                     );
                     insert_unique_note(
                         &mut state,
@@ -1798,6 +1801,7 @@ async fn upsert_peer(
         Some(peer_clone.address.clone()),
         Some(peer_clone.display_name.clone()),
         true,
+        false,
     );
     peer_clone
 }
@@ -2058,6 +2062,7 @@ async fn apply_session_hello(
         Some(peer_address),
         Some(display_name),
         true,
+        true,
     );
 }
 
@@ -2168,7 +2173,7 @@ fn room_rendezvous_record_key(room_name: &str) -> String {
     format!("{RENDEZVOUS_RECORD_PREFIX}room/{}", room_name.trim())
 }
 
-fn current_rendezvous_invite(state: &DaemonStatus) -> Option<CompactInviteV1> {
+fn current_direct_call_invite(state: &DaemonStatus) -> Option<CompactInviteV1> {
     if state.local_peer_id == "<starting>" || state.local_peer_id.is_empty() {
         return None;
     }
@@ -2193,29 +2198,44 @@ fn current_rendezvous_invite(state: &DaemonStatus) -> Option<CompactInviteV1> {
     } else {
         Some(CompactInviteV1 {
             v: 1,
+            kind: CompactInviteKind::DirectCall,
             peer_id: state.local_peer_id.clone(),
             addrs,
-            invite_code: state.session.invite_code.clone(),
-            expires_at_ms: state.session.invite_expires_at_ms,
+            invite_code: None,
+            room_name: None,
+            expires_at_ms: None,
         })
     }
 }
 
 fn current_rendezvous_records(state: &DaemonStatus) -> Vec<(String, CompactInviteV1)> {
-    let Some(invite) = current_rendezvous_invite(state) else {
+    let Some(direct_call_invite) = current_direct_call_invite(state) else {
         return Vec::new();
     };
 
-    let mut records = vec![(rendezvous_record_key(&invite.peer_id), invite.clone())];
-    if let Some(invite_code) = state.session.invite_code.as_deref() {
-        let invite_code = invite_code.trim();
-        if !invite_code.is_empty() {
-            records.push((room_rendezvous_record_key(invite_code), invite.clone()));
-        }
-    } else if let Some(room_name) = state.session.room_name.as_deref() {
-        let room_name = room_name.trim();
-        if !room_name.is_empty() && room_name != DEFAULT_ROOM_NAMESPACE {
-            records.push((room_rendezvous_record_key(room_name), invite));
+    let mut records = vec![(
+        rendezvous_record_key(&direct_call_invite.peer_id),
+        direct_call_invite.clone(),
+    )];
+    if let Some(room) = state.rooms.iter().find(|room| room.engaged) {
+        if let Some(room_invite) = &room.current_invite {
+            let room_name = room.name.trim();
+            let invite_code = room_invite.invite_code.trim();
+            let invite = CompactInviteV1 {
+                v: 1,
+                kind: CompactInviteKind::Room,
+                peer_id: state.local_peer_id.clone(),
+                addrs: direct_call_invite.addrs.clone(),
+                invite_code: (!invite_code.is_empty()).then_some(invite_code.to_string()),
+                room_name: (!room_name.is_empty()).then_some(room_name.to_string()),
+                expires_at_ms: room_invite.expires_at_ms,
+            };
+            if !invite_code.is_empty() {
+                records.push((room_rendezvous_record_key(invite_code), invite.clone()));
+            }
+            if !room_name.is_empty() && room_name != DEFAULT_ROOM_NAMESPACE {
+                records.push((room_rendezvous_record_key(room_name), invite));
+            }
         }
     }
     records
@@ -2228,6 +2248,7 @@ fn decode_rendezvous_record(payload: &[u8]) -> Option<CompactInviteV1> {
     }
     Some(CompactInviteV1 {
         v: invite.v,
+        kind: invite.kind,
         peer_id: invite.peer_id.trim().to_string(),
         addrs: invite
             .addrs
@@ -2239,6 +2260,10 @@ fn decode_rendezvous_record(payload: &[u8]) -> Option<CompactInviteV1> {
             .invite_code
             .map(|code| code.trim().to_string())
             .filter(|code| !code.is_empty()),
+        room_name: invite
+            .room_name
+            .map(|room_name| room_name.trim().to_string())
+            .filter(|room_name| !room_name.is_empty()),
         expires_at_ms: invite.expires_at_ms,
     })
 }
@@ -2310,7 +2335,7 @@ async fn seed_rendezvous_invite(state: &Arc<RwLock<DaemonStatus>>, invite: &Comp
         .network
         .ignored_peer_ids
         .retain(|id| id != &invite.peer_id);
-    update_known_peer(&mut state, &invite.peer_id, None, None, false);
+    update_known_peer(&mut state, &invite.peer_id, None, None, false, false);
     for address in &invite.addrs {
         let normalized = shareable_address(address, &invite.peer_id)
             .unwrap_or_else(|| address.trim().to_string());
@@ -2360,17 +2385,31 @@ fn remove_addr(addresses: &mut Vec<String>, address: &str) {
 }
 
 fn update_share_invite(state: &mut DaemonStatus) {
-    state.network.share_invite =
-        best_share_invite(state).or_else(|| {
-            state
-                .network
-                .share_invite
-                .clone()
-                .filter(|invite| {
-                    !invite.is_empty()
-                        && shareable_address(invite, &state.local_peer_id).is_some()
-                })
+    state.network.direct_call_invite = best_direct_call_invite(state).or_else(|| {
+        state
+            .network
+            .direct_call_invite
+            .clone()
+            .filter(|invite| !invite.is_empty() && shareable_address(invite, &state.local_peer_id).is_some())
+    });
+
+    let room_invite_update = state
+        .rooms
+        .iter()
+        .find(|room| room.engaged)
+        .and_then(|room| {
+            room.current_invite
+                .as_ref()
+                .map(|invite| (room.name.clone(), best_room_invite(state, room.name.as_str(), invite)))
         });
+
+    if let Some((room_name, share_invite)) = room_invite_update {
+        if let Some(room) = state.rooms.iter_mut().find(|room| room.name == room_name) {
+            if let Some(current_invite) = room.current_invite.as_mut() {
+                current_invite.share_invite = share_invite;
+            }
+        }
+    }
 }
 
 fn update_known_peer(
@@ -2379,6 +2418,7 @@ fn update_known_peer(
     address: Option<String>,
     display_name: Option<String>,
     connected: bool,
+    seen: bool,
 ) {
     if state
         .network
@@ -2408,6 +2448,7 @@ fn update_known_peer(
             last_dial_addr: None,
             connected,
             pinned: false,
+            seen,
             whitelisted: false,
         });
         state
@@ -2425,35 +2466,71 @@ fn update_known_peer(
         entry.last_dial_addr = Some(addr);
     }
     entry.connected = connected;
+    entry.seen |= seen;
+    state.network.refresh_user_views();
 }
 
-fn best_share_invite(state: &DaemonStatus) -> Option<String> {
+fn best_direct_call_invite(state: &DaemonStatus) -> Option<String> {
     let local_peer_id = &state.local_peer_id;
     let network = &state.network;
-    let addrs: Vec<String> = [
-        &network.external_addrs,
-        &network.observed_addrs,
-        &network.listen_addrs,
-    ]
-    .into_iter()
-    .flat_map(|addresses| addresses.iter())
-    .filter_map(|address| shareable_address(address, local_peer_id))
-    .fold(Vec::new(), |mut acc, address| {
-        if !acc.contains(&address) {
-            acc.push(address);
-        }
-        acc
-    });
+    let mut addrs = Vec::new();
+
+    collect_shareable_invite_addrs(&mut addrs, &network.external_addrs, local_peer_id);
+    collect_shareable_invite_addrs(&mut addrs, &network.observed_addrs, local_peer_id);
+    collect_shareable_invite_addrs(&mut addrs, &network.listen_addrs, local_peer_id);
 
     if addrs.is_empty() {
         None
     } else {
-        Some(encode_peer_compact_invite(
+        Some(encode_peer_compact_invite(local_peer_id, &addrs, None, None))
+    }
+}
+
+fn best_room_invite(
+    state: &DaemonStatus,
+    room_name: &str,
+    room_invite: &voicers_core::RoomInviteSummary,
+) -> Option<String> {
+    let local_peer_id = &state.local_peer_id;
+    let network = &state.network;
+    let mut addrs = Vec::new();
+
+    collect_shareable_invite_addrs(&mut addrs, &network.external_addrs, local_peer_id);
+    collect_shareable_invite_addrs(&mut addrs, &network.observed_addrs, local_peer_id);
+    collect_shareable_invite_addrs(&mut addrs, &network.listen_addrs, local_peer_id);
+
+    if addrs.is_empty() || room_invite.invite_code.trim().is_empty() {
+        None
+    } else {
+        Some(encode_room_compact_invite(
             local_peer_id,
+            room_name,
             &addrs,
-            state.session.invite_code.as_deref(),
-            state.session.invite_expires_at_ms,
+            &room_invite.invite_code,
+            room_invite.expires_at_ms,
         ))
+    }
+}
+
+fn collect_shareable_invite_addrs(
+    dest: &mut Vec<String>,
+    addresses: &[String],
+    local_peer_id: &str,
+) {
+    for address in addresses {
+        if dest.len() >= MAX_SHARE_INVITE_ADDRS {
+            break;
+        }
+
+        let Some(address) = shareable_address(address, local_peer_id) else {
+            continue;
+        };
+
+        if dest.contains(&address) {
+            continue;
+        }
+
+        dest.push(address);
     }
 }
 
@@ -2575,13 +2652,14 @@ fn short_peer_id(peer_id: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_shareable_multiaddr, is_supported_dial_addr, shareable_address,
-        should_surface_connected_peer,
+        best_direct_call_invite, is_shareable_multiaddr, is_supported_dial_addr, shareable_address,
+        should_surface_connected_peer, MAX_SHARE_INVITE_ADDRS,
     };
     use libp2p::Multiaddr;
     use voicers_core::{
-        AudioBackend, AudioEngineStage, AudioSummary, DaemonStatus, NetworkSummary,
-        OutputStrategy, PeerSummary, PendingPeerApprovalSummary, SessionSummary,
+        parse_join_target, AudioBackend, AudioEngineStage, AudioSummary, DaemonStatus,
+        JoinTarget, NetworkSummary, OutputStrategy, PeerSummary, PendingPeerApprovalSummary,
+        SessionSummary,
     };
 
     #[test]
@@ -2641,6 +2719,7 @@ mod tests {
                 last_dial_addr: None,
                 connected: false,
                 pinned: false,
+                seen: true,
                 whitelisted: false,
             }],
             Vec::new(),
@@ -2669,6 +2748,33 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn direct_call_invite_limits_advertised_addresses() {
+        let mut state = test_status(Vec::new(), Vec::new(), Vec::new());
+        state.local_peer_id = "12D3KooWExamplePeer".to_string();
+        state.network.external_addrs = vec![
+            "/ip4/198.51.100.10/tcp/4001".to_string(),
+            "/ip4/198.51.100.11/tcp/4002".to_string(),
+            "/ip4/198.51.100.12/tcp/4003".to_string(),
+        ];
+        state.network.observed_addrs = vec![
+            "/ip4/203.0.113.10/tcp/4101".to_string(),
+            "/ip4/203.0.113.11/tcp/4102".to_string(),
+        ];
+        state.network.listen_addrs = vec![
+            "/ip4/192.168.1.10/tcp/4010".to_string(),
+            "/ip4/192.168.1.11/tcp/4011".to_string(),
+        ];
+
+        let invite = best_direct_call_invite(&state).expect("share invite should exist");
+        match parse_join_target(&invite) {
+            JoinTarget::Invite(invite) => {
+                assert_eq!(invite.addrs.len(), MAX_SHARE_INVITE_ADDRS);
+            }
+            other => panic!("expected structured invite, got {other:?}"),
+        }
+    }
+
     fn test_status(
         peers: Vec<PeerSummary>,
         known_peers: Vec<voicers_core::KnownPeerSummary>,
@@ -2682,9 +2788,8 @@ mod tests {
                 room_name: None,
                 display_name: "local".to_string(),
                 self_muted: false,
-                invite_code: None,
-                invite_expires_at_ms: None,
             },
+            rooms: Vec::new(),
             network: NetworkSummary {
                 implementation: "libp2p".to_string(),
                 transport_stage: String::new(),
@@ -2698,8 +2803,11 @@ mod tests {
                 path_scores: Vec::new(),
                 saved_peer_addrs: Vec::new(),
                 known_peers,
+                friends: Vec::new(),
+                seen_users: Vec::new(),
+                discovered_peers: Vec::new(),
                 ignored_peer_ids: Vec::new(),
-                share_invite: None,
+                direct_call_invite: None,
             },
             audio: AudioSummary {
                 backend: AudioBackend::Unknown,
