@@ -1,5 +1,10 @@
+#[path = "media/dsp.rs"]
+mod dsp;
+#[path = "media/jitter.rs"]
+mod jitter;
+
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{HashMap, VecDeque},
     convert::TryInto,
     f32::consts::PI,
     sync::mpsc as std_mpsc,
@@ -238,7 +243,7 @@ struct EncodedPacket {
 }
 
 struct JitterBuffer {
-    pending: BTreeMap<u64, EncodedPacket>,
+    pending: std::collections::BTreeMap<u64, EncodedPacket>,
     next_playout_timestamp_samples: Option<u64>,
     next_playout_deadline: Option<Instant>,
     target_depth: usize,
@@ -266,22 +271,56 @@ impl Drop for CaptureRuntime {
     }
 }
 
-pub async fn start(state: Arc<RwLock<DaemonStatus>>) -> MediaHandle {
-    let output_backend = audio_backend::start(Arc::clone(&state)).await;
-    let available_capture_devices = enumerate_input_device_names();
+pub async fn start(
+    state: Arc<RwLock<DaemonStatus>>,
+    enable_audio_io: bool,
+    enable_capture_input: bool,
+) -> MediaHandle {
+    let output_backend = if enable_audio_io {
+        audio_backend::start(Arc::clone(&state)).await
+    } else {
+        audio_backend::start_noop()
+    };
+    let capture_enabled = enable_audio_io && enable_capture_input;
+    let available_capture_devices = if capture_enabled {
+        enumerate_input_device_names()
+    } else {
+        Vec::new()
+    };
     let (command_tx, command_rx) = mpsc::channel(64);
-    let capture_bootstrap = match build_capture_stream(None) {
-        Ok(bootstrap) => Some(bootstrap),
-        Err(error) => {
-            let mut state = state.write().await;
-            state.audio.engine = AudioEngineStage::Live;
-            state.audio.source = Some("generated-tone-fallback".to_string());
-            insert_unique_note(
-                &mut state,
-                format!("microphone capture unavailable, using fallback tone: {error}"),
-            );
-            None
+    let capture_bootstrap = if capture_enabled {
+        match build_capture_stream(None) {
+            Ok(bootstrap) => Some(bootstrap),
+            Err(error) => {
+                let mut state = state.write().await;
+                state.audio.engine = AudioEngineStage::Live;
+                state.audio.source = Some("generated-tone-fallback".to_string());
+                insert_unique_note(
+                    &mut state,
+                    format!("microphone capture unavailable, using fallback tone: {error}"),
+                );
+                None
+            }
         }
+    } else if enable_audio_io {
+        let mut state = state.write().await;
+        state.audio.engine = AudioEngineStage::Live;
+        state.audio.source = Some("generated-tone-fallback".to_string());
+        insert_unique_note(
+            &mut state,
+            "microphone capture disabled for this daemon instance; using fallback tone"
+                .to_string(),
+        );
+        None
+    } else {
+        let mut state = state.write().await;
+        state.audio.engine = AudioEngineStage::QueueingOnly;
+        state.audio.source = Some("disabled-for-tests".to_string());
+        insert_unique_note(
+            &mut state,
+            "audio device integration disabled for this daemon instance".to_string(),
+        );
+        None
     };
 
     {
@@ -1119,258 +1158,6 @@ impl CapturePipeline {
     }
 }
 
-impl VoiceProcessorChain {
-    fn new() -> Self {
-        Self {
-            high_pass: HighPassFilter::new(HPF_ALPHA),
-            noise_gate: AdaptiveNoiseGate::new(),
-        }
-    }
-
-    fn reset(&mut self) {
-        self.high_pass.reset();
-        self.noise_gate.reset();
-    }
-
-    fn process_frame(&mut self, frame: &mut [f32]) {
-        self.high_pass.process(frame);
-        self.noise_gate.process(frame);
-    }
-}
-
-impl HighPassFilter {
-    fn new(alpha: f32) -> Self {
-        Self {
-            alpha,
-            prev_input: 0.0,
-            prev_output: 0.0,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.prev_input = 0.0;
-        self.prev_output = 0.0;
-    }
-
-    fn process(&mut self, frame: &mut [f32]) {
-        for sample in frame {
-            let output = self.alpha * (self.prev_output + *sample - self.prev_input);
-            self.prev_input = *sample;
-            self.prev_output = output;
-            *sample = output;
-        }
-    }
-}
-
-impl AdaptiveNoiseGate {
-    fn new() -> Self {
-        Self {
-            noise_floor_rms: 0.0015,
-            gain: 1.0,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.noise_floor_rms = 0.0015;
-        self.gain = 1.0;
-    }
-
-    fn process(&mut self, frame: &mut [f32]) {
-        let rms = rms_level(frame);
-        let noise_update = if rms < self.noise_floor_rms {
-            NOISE_FLOOR_ATTACK
-        } else {
-            NOISE_FLOOR_DECAY
-        };
-        self.noise_floor_rms += (rms - self.noise_floor_rms) * noise_update;
-
-        let open_threshold = (self.noise_floor_rms * GATE_OPEN_MULTIPLIER).max(0.003);
-        let close_threshold = (self.noise_floor_rms * GATE_CLOSE_MULTIPLIER).max(0.002);
-        let target_gain = if rms >= open_threshold {
-            1.0
-        } else if rms <= close_threshold {
-            GATE_FLOOR_GAIN
-        } else {
-            let span = (open_threshold - close_threshold).max(f32::EPSILON);
-            let ratio = (rms - close_threshold) / span;
-            GATE_FLOOR_GAIN + (1.0 - GATE_FLOOR_GAIN) * ratio
-        };
-
-        let smoothing = if target_gain > self.gain {
-            GATE_GAIN_ATTACK
-        } else {
-            GATE_GAIN_RELEASE
-        };
-        self.gain += (target_gain - self.gain) * smoothing;
-
-        for sample in frame {
-            *sample *= self.gain;
-        }
-    }
-}
-
-impl JitterBuffer {
-    fn new() -> Self {
-        Self {
-            pending: BTreeMap::new(),
-            next_playout_timestamp_samples: None,
-            next_playout_deadline: None,
-            target_depth: JITTER_TARGET_DEPTH,
-            stable_playout_ticks: 0,
-            late_packets: 0,
-            lost_packets: 0,
-            concealed_frames: 0,
-            drift_corrections: 0,
-        }
-    }
-
-    fn insert(&mut self, packet: EncodedPacket) {
-        if let Some(next_playout) = self.next_playout_timestamp_samples {
-            if packet.timestamp_samples < next_playout {
-                self.late_packets += 1;
-                self.raise_target_depth();
-                return;
-            }
-        }
-
-        self.pending
-            .entry(packet.timestamp_samples)
-            .or_insert(packet);
-
-        while self.pending.len() > JITTER_MAX_DEPTH {
-            let Some((&oldest, _)) = self.pending.first_key_value() else {
-                break;
-            };
-            if Some(oldest) == self.next_playout_timestamp_samples {
-                break;
-            }
-            self.pending.remove(&oldest);
-            self.drift_corrections += 1;
-        }
-    }
-
-    fn next_playout_decision(&mut self, now: Instant) -> PlayoutDecision {
-        if self.next_playout_timestamp_samples.is_none() {
-            if self.pending.len() < self.target_depth {
-                return PlayoutDecision::Hold;
-            }
-            self.next_playout_timestamp_samples = self
-                .pending
-                .first_key_value()
-                .map(|(&timestamp, _)| timestamp);
-            let startup_lead = self.target_depth.saturating_sub(1) as u32;
-            let startup_offset =
-                Duration::from_millis(u64::from(FRAME_DURATION_MS) * u64::from(startup_lead));
-            self.next_playout_deadline = now.checked_sub(startup_offset).or(Some(now));
-            self.stable_playout_ticks = 0;
-        }
-
-        let Some(deadline) = self.next_playout_deadline else {
-            return PlayoutDecision::Hold;
-        };
-        if now < deadline {
-            return PlayoutDecision::Hold;
-        }
-
-        let expected = self
-            .next_playout_timestamp_samples
-            .expect("playout timestamp initialized");
-
-        if let Some((&earliest, _)) = self.pending.first_key_value() {
-            let max_gap = FRAME_SAMPLES_U64 * DRIFT_REBASE_THRESHOLD_FRAMES;
-            if earliest > expected + max_gap {
-                self.next_playout_timestamp_samples = Some(earliest);
-                self.next_playout_deadline = Some(now);
-                self.drift_corrections += 1;
-            }
-        }
-
-        let expected = self
-            .next_playout_timestamp_samples
-            .expect("playout timestamp available after rebase");
-
-        if let Some(packet) = self.pending.remove(&expected) {
-            self.advance_playout_clock(deadline, expected);
-            self.note_stable_tick();
-            return PlayoutDecision::Packet(packet);
-        }
-
-        let late_grace = Duration::from_millis(PLAYOUT_LATE_GRACE_MS);
-        if now < deadline + late_grace {
-            return PlayoutDecision::Hold;
-        }
-
-        // If the queue has drained below the target depth, stop clocking forward and
-        // re-prime on the next packets rather than generating a run of PLC silence.
-        if self.pending.len() < self.target_depth {
-            self.next_playout_timestamp_samples = None;
-            self.next_playout_deadline = None;
-            self.stable_playout_ticks = 0;
-            return PlayoutDecision::Hold;
-        }
-
-        if let Some(recovery_packet) = self
-            .pending
-            .get(&(expected + FRAME_SAMPLES_U64))
-            .map(|packet| packet.payload.clone())
-        {
-            self.advance_playout_clock(deadline, expected);
-            self.concealed_frames += 1;
-            self.lost_packets += 1;
-            self.raise_target_depth();
-            return PlayoutDecision::Fec { recovery_packet };
-        }
-
-        self.advance_playout_clock(deadline, expected);
-        self.concealed_frames += 1;
-        self.lost_packets += 1;
-        self.raise_target_depth();
-        PlayoutDecision::Conceal
-    }
-
-    fn stream_state(&self) -> MediaStreamState {
-        if self.next_playout_timestamp_samples.is_some() {
-            MediaStreamState::Active
-        } else if self.pending.is_empty() {
-            MediaStreamState::Idle
-        } else {
-            MediaStreamState::Primed
-        }
-    }
-
-    fn queue_depth(&self) -> usize {
-        self.pending.len()
-    }
-
-    fn queued_samples(&self) -> usize {
-        self.pending.len() * FRAME_SAMPLES
-    }
-
-    fn advance_playout_clock(&mut self, deadline: Instant, expected: u64) {
-        self.next_playout_timestamp_samples = Some(expected + FRAME_SAMPLES_U64);
-        self.next_playout_deadline =
-            Some(deadline + Duration::from_millis(u64::from(FRAME_DURATION_MS)));
-    }
-
-    fn raise_target_depth(&mut self) {
-        self.target_depth = (self.target_depth + 1).min(JITTER_MAX_TARGET_DEPTH);
-        self.stable_playout_ticks = 0;
-    }
-
-    fn note_stable_tick(&mut self) {
-        if self.pending.len() <= self.target_depth {
-            self.stable_playout_ticks = 0;
-            return;
-        }
-
-        self.stable_playout_ticks += 1;
-        if self.stable_playout_ticks >= STABLE_PLAYOUT_TICKS_BEFORE_SHRINK {
-            self.target_depth = self.target_depth.saturating_sub(1).max(JITTER_MIN_DEPTH);
-            self.stable_playout_ticks = 0;
-        }
-    }
-}
-
 fn synthesize_frame(runtime: &mut MediaPeerRuntime) -> Vec<f32> {
     let mut frame = Vec::with_capacity(FRAME_SAMPLES);
     let phase_step = 2.0 * PI * runtime.tone_hz / SAMPLE_RATE_HZ as f32;
@@ -1536,85 +1323,5 @@ fn is_ignorable_input_stream_error(error: &cpal::StreamError) -> bool {
             .description
             .contains("`alsa::poll()` spuriously returned"),
         _ => false,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::{Duration, Instant};
-
-    use super::{
-        EncodedPacket, JitterBuffer, PlayoutDecision, FRAME_DURATION_MS, FRAME_SAMPLES_U64,
-    };
-
-    fn packet(sequence: u64, timestamp_samples: u64) -> EncodedPacket {
-        EncodedPacket {
-            timestamp_samples,
-            payload: vec![sequence as u8, 0x55],
-        }
-    }
-
-    fn next_frame_instant(now: Instant) -> Instant {
-        now + Duration::from_millis(u64::from(FRAME_DURATION_MS))
-    }
-
-    #[test]
-    fn jitter_buffer_primes_and_reorders_by_timestamp() {
-        let mut jitter = JitterBuffer::new();
-        let now = Instant::now();
-        jitter.insert(packet(4, FRAME_SAMPLES_U64 * 3));
-        jitter.insert(packet(2, FRAME_SAMPLES_U64));
-        jitter.insert(packet(1, 0));
-        jitter.insert(packet(3, FRAME_SAMPLES_U64 * 2));
-
-        match jitter.next_playout_decision(now) {
-            PlayoutDecision::Packet(packet) => assert_eq!(packet.payload[0], 1),
-            other => panic!("unexpected decision: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn jitter_buffer_uses_fec_for_single_frame_gap() {
-        let mut jitter = JitterBuffer::new();
-        let now = Instant::now();
-        jitter.insert(packet(1, 0));
-        jitter.insert(packet(3, FRAME_SAMPLES_U64 * 2));
-        jitter.insert(packet(4, FRAME_SAMPLES_U64 * 3));
-        jitter.insert(packet(5, FRAME_SAMPLES_U64 * 4));
-        jitter.insert(packet(6, FRAME_SAMPLES_U64 * 5));
-
-        let _ = jitter.next_playout_decision(now);
-        match jitter.next_playout_decision(next_frame_instant(now) + Duration::from_millis(6)) {
-            PlayoutDecision::Fec { recovery_packet } => assert_eq!(recovery_packet[0], 3),
-            other => panic!("unexpected decision: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn jitter_buffer_rebases_when_gap_is_too_large() {
-        let mut jitter = JitterBuffer::new();
-        let now = Instant::now();
-        jitter.insert(packet(1, 0));
-        jitter.insert(packet(2, FRAME_SAMPLES_U64));
-        jitter.insert(packet(3, FRAME_SAMPLES_U64 * 2));
-        jitter.insert(packet(4, FRAME_SAMPLES_U64 * 3));
-
-        let _ = jitter.next_playout_decision(now);
-        jitter.insert(packet(20, FRAME_SAMPLES_U64 * 20));
-        jitter.insert(packet(21, FRAME_SAMPLES_U64 * 21));
-        jitter.insert(packet(22, FRAME_SAMPLES_U64 * 22));
-
-        let _ = jitter.next_playout_decision(next_frame_instant(now));
-        let _ = jitter.next_playout_decision(next_frame_instant(next_frame_instant(now)));
-        let _ = jitter.next_playout_decision(next_frame_instant(next_frame_instant(
-            next_frame_instant(now),
-        )));
-
-        match jitter.next_playout_decision(next_frame_instant(next_frame_instant(
-            next_frame_instant(next_frame_instant(now)),
-        ))) {
-            PlayoutDecision::Packet(packet) => assert_eq!(packet.payload[0], 20),
-            other => panic!("unexpected decision: {other:?}"),
-        }
     }
 }

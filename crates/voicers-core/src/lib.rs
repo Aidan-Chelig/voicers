@@ -1,6 +1,8 @@
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CONTROL_ADDR: &str = "127.0.0.1:7767";
+pub const COMPACT_INVITE_PREFIX: &str = "voicers://join/";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
@@ -346,4 +348,40 @@ pub enum ControlResponse {
 
 fn default_hundred() -> u8 {
     100
+}
+
+pub fn encode_compact_invite(target: &str) -> String {
+    let encoded = URL_SAFE_NO_PAD.encode(target.trim().as_bytes());
+    format!("{COMPACT_INVITE_PREFIX}{encoded}")
+}
+
+pub fn decode_compact_invite(invite: &str) -> Option<String> {
+    let payload = invite.trim().strip_prefix(COMPACT_INVITE_PREFIX)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    Some(decoded.trim().to_string())
+}
+
+pub fn normalize_join_target(value: &str) -> String {
+    decode_compact_invite(value).unwrap_or_else(|| value.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_compact_invite, encode_compact_invite, normalize_join_target};
+
+    #[test]
+    fn compact_invite_round_trips_raw_multiaddr() {
+        let raw = "/ip4/203.0.113.10/tcp/4001/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN";
+        let invite = encode_compact_invite(raw);
+        assert!(invite.starts_with("voicers://join/"));
+        assert_eq!(decode_compact_invite(&invite).as_deref(), Some(raw));
+        assert_eq!(normalize_join_target(&invite), raw);
+    }
+
+    #[test]
+    fn normalize_join_target_leaves_raw_inputs_unchanged() {
+        let raw = "/ip4/198.51.100.10/tcp/4001/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb";
+        assert_eq!(normalize_join_target(raw), raw);
+    }
 }

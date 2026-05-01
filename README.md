@@ -7,6 +7,8 @@ daemon and a thin local client.
   localhost control IPC.
 - `voicers` is the terminal UI client that talks to the daemon.
 - `voicers-core` holds shared control and status types.
+- `archive/legacy-prototype` preserves the old root `src/` prototype for
+  reference only; it is not part of the active workspace.
 
 Audio is encoded with Opus. Networking is handled with `libp2p`.
 
@@ -85,6 +87,22 @@ printf '%s\n' '{"JoinPeer":{"address":"/ip4/203.0.113.10/tcp/4001/p2p/ALICE_PEER
   | nc 127.0.0.1 7767
 ```
 
+If the `JoinPeer.address` value is a known peer id instead of a literal
+multiaddr, `voicersd` resolves that peer through its saved address book,
+ranks the saved addresses, and dials the best candidate first. The current
+ranking is biased toward previously successful direct paths, then previously
+successful relayed paths, with the most recently used address used as a
+tiebreaker.
+
+If the first outbound dial fails, the daemon automatically retries the next
+ranked saved address for that same peer. This fallback loop is daemon-side, so
+the TUI and control clients only need to issue one `JoinPeer` request.
+
+The same ranking logic also applies when the request is a multiaddr that
+already includes a known peer id. In that case the requested multiaddr is kept
+as a candidate, but the daemon also considers the peer's other saved addresses
+before deciding the retry order.
+
 For peers on separate home networks, direct dialing only works when at least one
 peer has a reachable public address, a port forward, or a working automatic port
 mapping. The daemon attempts UPnP and records observed or mapped addresses in
@@ -131,20 +149,27 @@ Each user can run the TUI in another terminal:
 ./target/debug/voicers
 ```
 
-Alice gets her status and shares `network.share_invite` with Bob. If
-`share_invite` is empty, she can share one of the displayed `external_addrs`,
-`observed_addrs`, or `listen_addrs` after appending `/p2p/ALICE_PEER_ID`.
+Alice gets her status and shares `network.share_invite` with Bob. The normal
+share string is now a compact `voicers://join/...` invite instead of a raw
+multiaddr. The daemon still accepts raw multiaddrs for debugging and explicit
+dials, but the intended user-facing flow is invite-first.
 
 ```sh
 printf '%s\n' '"GetStatus"' | nc 127.0.0.1 7767
 ```
 
-Bob dials Alice's shared multiaddr:
+Bob dials Alice's shared invite:
 
 ```sh
 printf '%s\n' '{"JoinPeer":{"address":"ALICE_SHARE_INVITE"}}' \
   | nc 127.0.0.1 7767
 ```
+
+After at least one successful connection, saving Alice into Bob's known-peer
+list lets later reconnects use the daemon-side ranked fallback path. The TUI's
+Known Peers reconnect action now sends Alice's peer id back to the daemon so
+the daemon can choose among Alice's saved addresses instead of reusing only one
+hard-coded address.
 
 After the libp2p session connects, either side can start WebRTC/ICE for the
 media data path. Bob can get Alice's peer id from status, then create the offer:
@@ -239,6 +264,90 @@ The current DHT support is for bootstrap, routing-table discovery, relay
 candidate discovery, and relay reservation attempts. It does not yet provide
 room-name or user-name rendezvous. For now, peers still need to exchange a
 specific multiaddr out of band or through a future rendezvous layer.
+
+## Testing Ranked Fallback Locally
+
+Use separate control ports and state files when you run two daemons on one
+machine:
+
+```sh
+mkdir -p /tmp/voicers-demo
+```
+
+Terminal 1, start Alice on a fixed port:
+
+```sh
+./target/debug/voicersd \
+  --display-name Alice \
+  --control-addr 127.0.0.1:7767 \
+  --listen-addr /ip4/127.0.0.1/tcp/4001 \
+  --state-path /tmp/voicers-demo/alice.json \
+  --no-bootstrap \
+  --no-stun
+```
+
+Terminal 2, start Bob with his own control port and state file:
+
+```sh
+./target/debug/voicersd \
+  --display-name Bob \
+  --control-addr 127.0.0.1:7768 \
+  --listen-addr /ip4/127.0.0.1/tcp/4002 \
+  --state-path /tmp/voicers-demo/bob.json \
+  --no-bootstrap \
+  --no-stun
+```
+
+Terminal 3, ask Alice for her peer id, then have Bob dial Alice:
+
+```sh
+printf '%s\n' '"GetStatus"' | nc 127.0.0.1 7767
+printf '%s\n' '{"JoinPeer":{"address":"/ip4/127.0.0.1/tcp/4001/p2p/ALICE_PEER_ID"}}' \
+  | nc 127.0.0.1 7768
+```
+
+Once Bob sees Alice in `GetStatus`, save that peer from the TUI so
+`/tmp/voicers-demo/bob.json` contains Alice as a known peer. Then stop Alice
+and restart her on a different port:
+
+```sh
+./target/debug/voicersd \
+  --display-name Alice \
+  --control-addr 127.0.0.1:7767 \
+  --listen-addr /ip4/127.0.0.1/tcp/4011 \
+  --state-path /tmp/voicers-demo/alice.json \
+  --no-bootstrap \
+  --no-stun
+```
+
+Before reconnecting, edit `/tmp/voicers-demo/bob.json` so Alice's saved
+`addresses` list contains both the stale `4001` address and the new `4011`
+address, and leave `last_dial_addr` pointing at the stale `4001` address. That
+creates a deterministic "bad first candidate, good second candidate" test case
+for the fallback loop.
+
+Now reconnect from Bob using Alice's peer id instead of a single address:
+
+```sh
+printf '%s\n' '{"JoinPeer":{"address":"ALICE_PEER_ID"}}' | nc 127.0.0.1 7768
+```
+
+Watch Bob's `GetStatus` output while that runs:
+
+```sh
+printf '%s\n' '"GetStatus"' | nc 127.0.0.1 7768
+```
+
+These fields are the useful checkpoints:
+
+- `network.known_peers[*].addresses`: the saved candidate addresses for Alice.
+- `network.known_peers[*].last_dial_addr`: the address Bob last succeeded with.
+- `network.path_scores`: direct and relay success/failure counters used by the ranker.
+- `notes`: recent dial, retry, and fallback messages from the daemon.
+
+You should see the daemon try the best-ranked saved address first and, if that
+address is stale, retry the next saved address automatically without another
+`JoinPeer` request.
 
 ## STUN Servers
 

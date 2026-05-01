@@ -4833,6 +4833,7 @@ dependencies = [
 name = "voicers-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "serde",
 ]
 
@@ -4854,8 +4855,6 @@ dependencies = [
  "tokio-util",
  "voicers-core",
  "webrtc",
- "webrtc-ice",
- "webrtc-util",
 ]
 
 [[package]]

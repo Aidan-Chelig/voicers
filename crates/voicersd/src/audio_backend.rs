@@ -59,10 +59,17 @@ enum BackendCommand {
 
 pub async fn start(state: Arc<RwLock<DaemonStatus>>) -> OutputBackendHandle {
     let backend = select_backend(&state).await;
+    spawn_backend(backend)
+}
 
+pub fn start_noop() -> OutputBackendHandle {
+    let backend: Box<dyn OutputBackend> = Box::new(noop::Runtime::new());
+    spawn_backend(backend)
+}
+
+fn spawn_backend(mut backend: Box<dyn OutputBackend>) -> OutputBackendHandle {
     let (command_tx, mut command_rx) = mpsc::channel(128);
     tokio::spawn(async move {
-        let mut backend = backend;
         while let Some(command) = command_rx.recv().await {
             if let Err(error) = backend.handle(command).await {
                 eprintln!("audio backend error: {error:#}");
@@ -130,8 +137,7 @@ trait OutputBackend: Send {
     fn handle<'a>(&'a mut self, command: BackendCommand) -> BoxFuture<'a, Result<()>>;
 }
 
-#[cfg(not(target_os = "linux"))]
-mod null {
+mod noop {
     use super::{BackendCommand, OutputBackend, Result};
     use futures::{future::BoxFuture, FutureExt};
     use std::collections::HashSet;
@@ -164,6 +170,30 @@ mod null {
         fn handle<'a>(&'a mut self, command: BackendCommand) -> BoxFuture<'a, Result<()>> {
             async move {
                 self.handle_command(command);
+                Ok(())
+            }
+            .boxed()
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod null {
+    use super::{noop, BackendCommand, OutputBackend, Result};
+    use futures::{future::BoxFuture, FutureExt};
+
+    pub struct Runtime(noop::Runtime);
+
+    impl Runtime {
+        pub fn new() -> Self {
+            Self(noop::Runtime::new())
+        }
+    }
+
+    impl OutputBackend for Runtime {
+        fn handle<'a>(&'a mut self, command: BackendCommand) -> BoxFuture<'a, Result<()>> {
+            async move {
+                self.0.handle(command).await?;
                 Ok(())
             }
             .boxed()

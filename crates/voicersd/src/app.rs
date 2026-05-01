@@ -3,8 +3,9 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::Result;
 use tokio::sync::RwLock;
 use voicers_core::{
-    AudioBackend, AudioEngineStage, AudioSummary, ControlRequest, ControlResponse, DaemonStatus,
-    NetworkSummary, OutputStrategy, SessionHello, SessionSummary, DEFAULT_CONTROL_ADDR,
+    normalize_join_target, AudioBackend, AudioEngineStage, AudioSummary, ControlRequest,
+    ControlResponse, DaemonStatus, NetworkSummary, OutputStrategy, SessionHello, SessionSummary,
+    DEFAULT_CONTROL_ADDR,
 };
 
 #[cfg(feature = "webrtc-transport")]
@@ -21,9 +22,13 @@ pub struct AppConfig {
     pub listen_addr: String,
     pub relay_addr: Option<String>,
     pub bootstrap_addrs: Vec<String>,
+    pub use_default_bootstrap_addrs: bool,
     pub stun_servers: Vec<String>,
     pub turn_servers: Vec<TurnServerConfig>,
     pub enable_stun: bool,
+    pub enable_audio_io: bool,
+    pub enable_capture_input: bool,
+    pub enable_networking: bool,
     pub display_name: String,
     pub state_path: PathBuf,
 }
@@ -43,9 +48,13 @@ impl Default for AppConfig {
             listen_addr: "/ip4/0.0.0.0/tcp/0".to_string(),
             relay_addr: None,
             bootstrap_addrs: Vec::new(),
+            use_default_bootstrap_addrs: true,
             stun_servers: Vec::new(),
             turn_servers: Vec::new(),
             enable_stun: true,
+            enable_audio_io: true,
+            enable_capture_input: true,
+            enable_networking: true,
             display_name: "local-user".to_string(),
             state_path: persist::default_state_path(),
         }
@@ -116,39 +125,64 @@ impl App {
                 format!("state file {}", config.state_path.display()),
             ],
         }));
-        let media = media::start(Arc::clone(&state)).await;
-        #[cfg(feature = "webrtc-transport")]
-        let (webrtc, webrtc_signals, webrtc_media_frames, webrtc_connection_states) =
-            webrtc_transport::start(WebRtcTransportConfig {
-                stun_servers: config.stun_servers.clone(),
-                turn_servers: config
-                    .turn_servers
-                    .iter()
-                    .map(|server| webrtc_transport::TurnServerConfig {
-                        url: server.url.clone(),
-                        username: server.username.clone(),
-                        credential: server.credential.clone(),
-                    })
-                    .collect(),
-            })?;
-        let network = network::start(
+        let media = media::start(
             Arc::clone(&state),
-            &config.listen_addr,
-            config.relay_addr.as_deref(),
-            &config.bootstrap_addrs,
-            &config.stun_servers,
-            config.enable_stun,
+            config.enable_audio_io,
+            config.enable_capture_input,
+        )
+        .await;
+        let network = if config.enable_networking {
             #[cfg(feature = "webrtc-transport")]
-            Some(webrtc),
-            #[cfg(feature = "webrtc-transport")]
-            webrtc_signals,
-            #[cfg(feature = "webrtc-transport")]
-            webrtc_media_frames,
-            #[cfg(feature = "webrtc-transport")]
-            webrtc_connection_states,
-            media.clone(),
-            persistence.clone(),
-        )?;
+            let (webrtc, webrtc_signals, webrtc_media_frames, webrtc_connection_states) =
+                webrtc_transport::start(WebRtcTransportConfig {
+                    stun_servers: config.stun_servers.clone(),
+                    turn_servers: config
+                        .turn_servers
+                        .iter()
+                        .map(|server| webrtc_transport::TurnServerConfig {
+                            url: server.url.clone(),
+                            username: server.username.clone(),
+                            credential: server.credential.clone(),
+                        })
+                        .collect(),
+                })?;
+            network::start(
+                Arc::clone(&state),
+                &config.listen_addr,
+                config.relay_addr.as_deref(),
+                &config.bootstrap_addrs,
+                config.use_default_bootstrap_addrs,
+                &config.stun_servers,
+                config.enable_stun,
+                #[cfg(feature = "webrtc-transport")]
+                Some(webrtc),
+                #[cfg(feature = "webrtc-transport")]
+                webrtc_signals,
+                #[cfg(feature = "webrtc-transport")]
+                webrtc_media_frames,
+                #[cfg(feature = "webrtc-transport")]
+                webrtc_connection_states,
+                media.clone(),
+                persistence.clone(),
+            )?
+        } else {
+            {
+                let mut state = state.write().await;
+                state.network.transport_stage = "network disabled for tests".to_string();
+                state.network.nat_status = "not probing reachability".to_string();
+                state.network.listen_addrs.clear();
+                state.network.external_addrs.clear();
+                state.network.observed_addrs.clear();
+                state.network.stun_addrs.clear();
+                state
+                    .notes
+                    .push("daemon networking disabled for this instance".to_string());
+            }
+            network::NetworkBootstrap {
+                peer_id: "test-local-peer".to_string(),
+                handle: network::NetworkHandle::noop(),
+            }
+        };
 
         {
             let mut state = state.write().await;
@@ -187,12 +221,15 @@ impl App {
                     message: format!("room set to {room_name}"),
                 }
             }
-            ControlRequest::JoinPeer { address } => match self.network.dial(address).await {
-                Ok(message) => ControlResponse::Ack { message },
-                Err(error) => ControlResponse::Error {
-                    message: error.to_string(),
-                },
-            },
+            ControlRequest::JoinPeer { address } => {
+                let address = normalize_join_target(&address);
+                match self.network.dial(address).await {
+                    Ok(message) => ControlResponse::Ack { message },
+                    Err(error) => ControlResponse::Error {
+                        message: error.to_string(),
+                    },
+                }
+            }
             ControlRequest::ToggleMuteSelf => {
                 let mut state = self.state.write().await;
                 state.session.self_muted = !state.session.self_muted;
@@ -458,5 +495,35 @@ impl App {
             last_share_invite: state.network.share_invite.clone(),
             path_scores: state.network.path_scores.clone(),
         })
+    }
+
+    #[doc(hidden)]
+    pub async fn seed_peer_for_tests(&self, peer_id: &str, display_name: &str, address: &str) {
+        let mut state = self.state.write().await;
+        state.peers.push(voicers_core::PeerSummary {
+            peer_id: peer_id.to_string(),
+            display_name: display_name.to_string(),
+            address: address.to_string(),
+            muted: false,
+            output_volume_percent: 100,
+            output_bus: "peer_bus_01".to_string(),
+            transport: voicers_core::PeerTransportState::Connected,
+            session: voicers_core::PeerSessionState::Handshaking,
+            media: voicers_core::PeerMediaState {
+                stream_state: voicers_core::MediaStreamState::Idle,
+                sent_packets: 0,
+                received_packets: 0,
+                tx_level_rms: 0.0,
+                rx_level_rms: 0.0,
+                lost_packets: 0,
+                late_packets: 0,
+                concealed_frames: 0,
+                drift_corrections: 0,
+                queued_packets: 0,
+                decoded_frames: 0,
+                queued_samples: 0,
+                last_sequence: None,
+            },
+        });
     }
 }

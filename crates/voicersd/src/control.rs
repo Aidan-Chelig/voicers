@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpListener,
+};
 use tokio_util::codec::{Framed, LinesCodec};
 use voicers_core::ControlRequest;
 
@@ -12,6 +15,21 @@ pub async fn serve(app: App) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind control socket at {control_addr}"))?;
 
+    serve_listener(app, listener).await
+}
+
+pub async fn serve_listener(app: App, listener: TcpListener) -> Result<()> {
+    serve_loop(app, listener).await
+}
+
+pub async fn serve_stream<T>(app: App, stream: T) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    handle_connection(app, stream).await
+}
+
+async fn serve_loop(app: App, listener: TcpListener) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let app = app.clone();
@@ -24,7 +42,10 @@ pub async fn serve(app: App) -> Result<()> {
     }
 }
 
-async fn handle_connection(app: App, stream: TcpStream) -> Result<()> {
+async fn handle_connection<T>(app: App, stream: T) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     let mut framed = Framed::new(stream, LinesCodec::new());
 
     while let Some(line) = framed.next().await {

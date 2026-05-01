@@ -1,7 +1,8 @@
 mod client;
+mod ui;
 
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -10,186 +11,28 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     prelude::*,
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
     DefaultTerminal,
 };
-use voicers_core::{
-    ControlRequest, ControlResponse, DaemonStatus, KnownPeerSummary, PeerMediaState,
-    PeerSessionState, PeerTransportState, DEFAULT_CONTROL_ADDR,
+use ui::{
+    model::{
+        adjust_percent, best_known_peer_address, default_flash, local_fallback_test_steps,
+        parse_ui_config, ranked_fallback_candidates, short_id, ConfigItem, InputMode, Screen,
+        UiApp, UiConfig,
+    },
+    theme::{
+        badge, color_accent, color_bg, color_good, color_muted, color_panel_alt, color_selected,
+        color_subtle, color_text, color_warn, label, panel_block, transport_color, transport_label,
+    },
 };
+use voicers_core::{ControlRequest, ControlResponse, KnownPeerSummary, DEFAULT_CONTROL_ADDR};
 
-struct UiApp {
-    control_addr: String,
-    daemon_bin: PathBuf,
-    status: Option<DaemonStatus>,
-    flash: String,
-    flash_until: Option<Instant>,
-    input_mode: InputMode,
-    dial_input: String,
-    room_input: String,
-    rename_input: String,
-    screen: Screen,
-    selected_peer: usize,
-    selected_config_item: usize,
-    selected_known_peer: usize,
-    daemon_launch: DaemonLaunchState,
-}
-
-const FLASH_DURATION: Duration = Duration::from_secs(3);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum InputMode {
-    Normal,
-    Dial,
-    Room,
-    ControlAddr,
-    RenameSelf,
-    RenameKnownPeer,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Screen {
-    Main,
-    Config,
-    KnownPeers,
-}
-
-enum ConfigItem {
-    InputGain,
-    CaptureDevice(String),
-    PeerVolume { peer_id: String },
-}
-
-#[derive(Default)]
-struct DaemonLaunchState {
-    attempted_auto_start: bool,
-    last_launch_at: Option<Instant>,
-}
-
-struct UiConfig {
-    control_addr: String,
-    daemon_bin: PathBuf,
-}
-
-impl UiApp {
-    fn new(config: UiConfig) -> Self {
-        Self {
-            control_addr: config.control_addr,
-            daemon_bin: config.daemon_bin,
-            status: None,
-            flash: default_flash(Screen::Main).to_string(),
-            flash_until: None,
-            input_mode: InputMode::Normal,
-            dial_input: "/ip4/127.0.0.1/tcp/".to_string(),
-            room_input: "dev-room".to_string(),
-            rename_input: String::new(),
-            screen: Screen::Main,
-            selected_peer: 0,
-            selected_config_item: 0,
-            selected_known_peer: 0,
-            daemon_launch: DaemonLaunchState::default(),
-        }
-    }
-
-    fn selected_peer_id(&self) -> Option<String> {
-        self.status
-            .as_ref()?
-            .peers
-            .get(self.selected_peer)
-            .map(|peer| peer.peer_id.clone())
-    }
-
-    fn selected_peer(&self) -> Option<&voicers_core::PeerSummary> {
-        self.status.as_ref()?.peers.get(self.selected_peer)
-    }
-
-    fn selected_known_peer(&self) -> Option<&KnownPeerSummary> {
-        self.status
-            .as_ref()?
-            .network
-            .known_peers
-            .get(self.selected_known_peer)
-    }
-
-    fn clamp_selection(&mut self) {
-        let len = self
-            .status
-            .as_ref()
-            .map(|status| status.peers.len())
-            .unwrap_or(0);
-        if len == 0 {
-            self.selected_peer = 0;
-        } else if self.selected_peer >= len {
-            self.selected_peer = len - 1;
-        }
-    }
-
-    fn clamp_config_selection(&mut self) {
-        let len = self.config_items().len();
-        if len == 0 {
-            self.selected_config_item = 0;
-        } else if self.selected_config_item >= len {
-            self.selected_config_item = len - 1;
-        }
-    }
-
-    fn clamp_known_peer_selection(&mut self) {
-        let len = self
-            .status
-            .as_ref()
-            .map(|status| status.network.known_peers.len())
-            .unwrap_or(0);
-        if len == 0 {
-            self.selected_known_peer = 0;
-        } else if self.selected_known_peer >= len {
-            self.selected_known_peer = len - 1;
-        }
-    }
-
-    fn config_items(&self) -> Vec<ConfigItem> {
-        let mut items = vec![ConfigItem::InputGain];
-        if let Some(status) = &self.status {
-            items.extend(
-                status
-                    .audio
-                    .available_capture_devices
-                    .iter()
-                    .cloned()
-                    .map(ConfigItem::CaptureDevice),
-            );
-            items.extend(status.peers.iter().map(|peer| ConfigItem::PeerVolume {
-                peer_id: peer.peer_id.clone(),
-            }));
-        }
-        items
-    }
-
-    fn set_flash(&mut self, message: impl Into<String>) {
-        self.flash = message.into();
-        self.flash_until = Some(Instant::now() + FLASH_DURATION);
-    }
-
-    fn set_flash_persistent(&mut self, message: impl Into<String>) {
-        self.flash = message.into();
-        self.flash_until = None;
-    }
-
-    fn restore_flash_if_expired(&mut self) {
-        if self
-            .flash_until
-            .map(|deadline| Instant::now() >= deadline)
-            .unwrap_or(false)
-        {
-            self.flash = default_flash(self.screen).to_string();
-            self.flash_until = None;
-        }
-    }
-}
+const DEFAULT_ROOM_NAME: &str = "main";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let terminal = ratatui::init();
-    let result = run_tui(terminal, parse_ui_config()).await;
+    let result = run_tui(terminal, parse_ui_config(DEFAULT_CONTROL_ADDR)).await;
     ratatui::restore();
     result
 }
@@ -197,6 +40,10 @@ async fn main() -> Result<()> {
 async fn run_tui(mut terminal: DefaultTerminal, config: UiConfig) -> Result<()> {
     let mut app = UiApp::new(config);
     let mut last_refresh = Instant::now() - Duration::from_secs(2);
+    let launched = launch_daemon(&mut app, true);
+    if launched {
+        app.set_flash_persistent("starting voicers and preparing your invite");
+    }
 
     loop {
         app.restore_flash_if_expired();
@@ -244,12 +91,18 @@ async fn handle_key(app: &mut UiApp, key: KeyCode) -> Result<bool> {
         Screen::Main => handle_main_screen(app, key).await,
         Screen::Config => handle_config_screen(app, key).await,
         Screen::KnownPeers => handle_known_peers_screen(app, key).await,
+        Screen::Help => handle_help_screen(app, key).await,
     }
 }
 
 async fn handle_main_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
     match key {
         KeyCode::Char('q') => return Ok(true),
+        KeyCode::Char('?') => {
+            app.previous_screen = Screen::Main;
+            app.screen = Screen::Help;
+            app.set_flash(default_flash(Screen::Help));
+        }
         KeyCode::Char('c') => {
             app.screen = Screen::Config;
             app.clamp_config_selection();
@@ -322,7 +175,11 @@ async fn handle_main_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
                 app.dial_input = saved.clone();
             }
             app.input_mode = InputMode::Dial;
-            app.set_flash_persistent("enter peer multiaddr and press Enter");
+            app.set_flash_persistent("paste an invite and press Enter");
+        }
+        KeyCode::Enter => {
+            app.input_mode = InputMode::Dial;
+            app.set_flash_persistent("paste an invite and press Enter");
         }
         KeyCode::Char('i') => {
             let invite = app
@@ -362,6 +219,11 @@ async fn handle_main_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
 async fn handle_config_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
     match key {
         KeyCode::Char('q') => return Ok(true),
+        KeyCode::Char('?') => {
+            app.previous_screen = Screen::Config;
+            app.screen = Screen::Help;
+            app.set_flash(default_flash(Screen::Help));
+        }
         KeyCode::Char('c') | KeyCode::Esc => {
             app.screen = Screen::Main;
             app.set_flash(default_flash(Screen::Main));
@@ -409,6 +271,11 @@ async fn handle_config_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
 async fn handle_known_peers_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
     match key {
         KeyCode::Char('q') => return Ok(true),
+        KeyCode::Char('?') => {
+            app.previous_screen = Screen::KnownPeers;
+            app.screen = Screen::Help;
+            app.set_flash(default_flash(Screen::Help));
+        }
         KeyCode::Char('p') | KeyCode::Esc => {
             app.screen = Screen::Main;
             app.set_flash(default_flash(Screen::Main));
@@ -467,6 +334,23 @@ async fn handle_known_peers_screen(app: &mut UiApp, key: KeyCode) -> Result<bool
         KeyCode::Char('g') => {
             refresh_status(app).await;
             app.clamp_known_peer_selection();
+            app.set_flash("status refreshed");
+        }
+        _ => {}
+    }
+
+    Ok(false)
+}
+
+async fn handle_help_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
+    match key {
+        KeyCode::Char('q') => return Ok(true),
+        KeyCode::Char('?') | KeyCode::Esc => {
+            app.screen = app.previous_screen;
+            app.set_flash(default_flash(app.screen));
+        }
+        KeyCode::Char('g') => {
+            refresh_status(app).await;
             app.set_flash("status refreshed");
         }
         _ => {}
@@ -581,6 +465,7 @@ async fn refresh_status(app: &mut UiApp) {
             app.clamp_config_selection();
             app.clamp_known_peer_selection();
             app.daemon_launch.attempted_auto_start = true;
+            ensure_default_room(app).await;
         }
         Ok(other) => {
             app.set_flash(render_message(Ok(other)));
@@ -600,6 +485,43 @@ async fn refresh_status(app: &mut UiApp) {
                     app.control_addr
                 ));
             }
+        }
+    }
+}
+
+async fn ensure_default_room(app: &mut UiApp) {
+    let needs_room = app
+        .status
+        .as_ref()
+        .map(|status| status.session.room_name.is_none())
+        .unwrap_or(false);
+
+    if !needs_room {
+        app.default_room_initialized = true;
+        return;
+    }
+
+    if app.default_room_initialized {
+        return;
+    }
+
+    app.default_room_initialized = true;
+    let response = client::send_request_to(
+        &app.control_addr,
+        ControlRequest::CreateRoom {
+            room_name: DEFAULT_ROOM_NAME.to_string(),
+        },
+    )
+    .await;
+
+    if matches!(response, Ok(ControlResponse::Ack { .. })) {
+        if let Ok(ControlResponse::Status(status)) =
+            client::send_request_to(&app.control_addr, ControlRequest::GetStatus).await
+        {
+            app.status = Some(status);
+            app.clamp_selection();
+            app.clamp_config_selection();
+            app.clamp_known_peer_selection();
         }
     }
 }
@@ -685,13 +607,18 @@ async fn reconnect_selected_known_peer(app: &mut UiApp) {
         return;
     };
 
-    let Some(address) = best_known_peer_address(&peer) else {
+    if best_known_peer_address(&peer).is_none() {
         app.set_flash(format!("{} has no saved dial address", peer.display_name));
         return;
-    };
+    }
 
-    let response =
-        client::send_request_to(&app.control_addr, ControlRequest::JoinPeer { address }).await;
+    let response = client::send_request_to(
+        &app.control_addr,
+        ControlRequest::JoinPeer {
+            address: peer.peer_id.clone(),
+        },
+    )
+    .await;
     app.set_flash(render_message(response));
     refresh_status(app).await;
 }
@@ -791,31 +718,6 @@ fn render_message(response: Result<ControlResponse>) -> String {
     }
 }
 
-fn default_flash(screen: Screen) -> &'static str {
-    match screen {
-        Screen::Main => {
-            "q quit | c config | p peers | n rename self | a save peer | tab control addr | s start daemon | r room | d dial | i invite | m mute self | x mute peer | j/k or arrows move"
-        }
-        Screen::Config => {
-            "q quit | c back | p peers | n rename self | s start daemon | enter select device | hjkl or arrows navigate"
-        }
-        Screen::KnownPeers => {
-            "q quit | p back | c config | u rename self | a save | n rename peer | D forget | enter or d reconnect | j/k or arrows move"
-        }
-    }
-}
-
-fn adjust_percent(current: u8, delta: i16) -> u8 {
-    let next = i16::from(current) + delta;
-    next.clamp(0, 200) as u8
-}
-
-fn best_known_peer_address(peer: &KnownPeerSummary) -> Option<String> {
-    peer.last_dial_addr
-        .clone()
-        .or_else(|| peer.addresses.first().cloned())
-}
-
 fn draw(frame: &mut Frame, app: &UiApp) {
     frame.render_widget(
         Block::default().style(Style::default().bg(color_bg()).fg(color_text())),
@@ -837,7 +739,7 @@ fn draw(frame: &mut Frame, app: &UiApp) {
             let right =
                 Layout::vertical([Constraint::Length(12), Constraint::Min(8)]).split(middle[1]);
             draw_peer_list(frame, app, middle[0]);
-            draw_peer_details(frame, app, right[0]);
+            draw_home_panel(frame, app, right[0]);
             draw_notes(frame, app, right[1]);
         }
         Screen::Config => {
@@ -852,6 +754,12 @@ fn draw(frame: &mut Frame, app: &UiApp) {
             draw_known_peers_screen(frame, app, middle[0]);
             draw_known_peer_details(frame, app, middle[1]);
         }
+        Screen::Help => {
+            let middle =
+                Layout::horizontal([Constraint::Length(72), Constraint::Min(28)]).split(root[1]);
+            draw_help_screen(frame, app, middle[0]);
+            draw_help_diagnostics(frame, app, middle[1]);
+        }
     }
     draw_footer(frame, app, root[2]);
 
@@ -862,6 +770,11 @@ fn draw(frame: &mut Frame, app: &UiApp) {
 
 fn draw_summary(frame: &mut Frame, app: &UiApp, area: Rect) {
     let lines = if let Some(status) = &app.status {
+        let invite = status
+            .network
+            .share_invite
+            .clone()
+            .unwrap_or_else(|| "<preparing shareable invite>".to_string());
         vec![
             Line::from(vec![
                 Span::styled(
@@ -875,7 +788,7 @@ fn draw_summary(frame: &mut Frame, app: &UiApp, area: Rect) {
                         .session
                         .room_name
                         .clone()
-                        .unwrap_or_else(|| "NO ROOM".to_string()),
+                        .unwrap_or_else(|| DEFAULT_ROOM_NAME.to_string()),
                     color_panel_alt(),
                     color_text(),
                 ),
@@ -913,10 +826,32 @@ fn draw_summary(frame: &mut Frame, app: &UiApp, area: Rect) {
                 ),
             ]),
             Line::from(vec![
-                label("CONTROL"),
+                label("INVITE"),
                 Span::raw(" "),
-                Span::styled(app.control_addr.clone(), Style::default().fg(color_text())),
-                Span::raw("    "),
+                Span::styled(invite, Style::default().fg(color_text())),
+            ]),
+            Line::from(vec![
+                label("JOIN"),
+                Span::raw(" "),
+                Span::styled(
+                    "share this invite; your friend presses Enter and pastes it",
+                    Style::default().fg(color_muted()),
+                ),
+            ]),
+            Line::from(vec![
+                label("STATE"),
+                Span::raw(" "),
+                Span::styled(
+                    format!(
+                        "{} | {} peers | {}",
+                        status.network.transport_stage,
+                        status.peers.len(),
+                        status.network.selected_media_path
+                    ),
+                    Style::default().fg(color_text()),
+                ),
+            ]),
+            Line::from(vec![
                 label("AUDIO"),
                 Span::raw(" "),
                 Span::styled(
@@ -931,46 +866,6 @@ fn draw_summary(frame: &mut Frame, app: &UiApp, area: Rect) {
                         status.audio.frame_size_ms.unwrap_or(0),
                         status.audio.sample_rate_hz.unwrap_or(0)
                     ),
-                    Style::default().fg(color_text()),
-                ),
-            ]),
-            Line::from(vec![
-                label("INVITE"),
-                Span::raw(" "),
-                Span::styled(
-                    status
-                        .network
-                        .share_invite
-                        .clone()
-                        .unwrap_or_else(|| "<waiting for reachable addr>".to_string()),
-                    Style::default().fg(color_text()),
-                ),
-            ]),
-            Line::from(vec![
-                label("CAPTURE"),
-                Span::raw(" "),
-                Span::styled(
-                    format!(
-                        "{} via {}",
-                        status
-                            .audio
-                            .capture_device
-                            .clone()
-                            .unwrap_or_else(|| "<none>".to_string()),
-                        status
-                            .audio
-                            .source
-                            .clone()
-                            .unwrap_or_else(|| "<none>".to_string())
-                    ),
-                    Style::default().fg(color_text()),
-                ),
-            ]),
-            Line::from(vec![
-                label("TRANSPORT"),
-                Span::raw(" "),
-                Span::styled(
-                    status.network.transport_stage.clone(),
                     Style::default().fg(color_text()),
                 ),
             ]),
@@ -1058,20 +953,100 @@ fn draw_summary(frame: &mut Frame, app: &UiApp, area: Rect) {
                 ),
                 badge("OFFLINE", color_warn(), color_bg()),
             ]),
-            Line::from(vec![
-                label("CONTROL"),
-                Span::raw(" "),
-                Span::styled(app.control_addr.clone(), Style::default().fg(color_text())),
-            ]),
             Line::from(Span::styled(
-                "waiting for daemon status",
+                "starting voicers and preparing your invite",
                 Style::default().fg(color_muted()),
             )),
         ]
     };
 
     let widget = Paragraph::new(lines)
-        .block(panel_block("Server", color_accent()))
+        .block(panel_block("Home", color_accent()))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(widget, area);
+}
+
+fn draw_home_panel(frame: &mut Frame, app: &UiApp, area: Rect) {
+    let lines = if let Some(status) = &app.status {
+        let invite = status
+            .network
+            .share_invite
+            .clone()
+            .unwrap_or_else(|| "<preparing shareable invite>".to_string());
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    "Your Invite",
+                    Style::default()
+                        .fg(color_text())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                badge(
+                    if status.network.share_invite.is_some() {
+                        "ready"
+                    } else {
+                        "preparing"
+                    },
+                    if status.network.share_invite.is_some() {
+                        color_good()
+                    } else {
+                        color_panel_alt()
+                    },
+                    color_bg(),
+                ),
+            ]),
+            Line::from(Span::styled(invite, Style::default().fg(color_text()))),
+            Line::from(""),
+            Line::from("1. Share this invite."),
+            Line::from("2. Your friend opens Voicers and presses Enter."),
+            Line::from("3. They paste the invite and press Enter again."),
+        ];
+
+        if let Some(peer) = app.selected_peer() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Selected Peer",
+                    Style::default()
+                        .fg(color_text())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                badge(
+                    transport_label(&peer.transport),
+                    transport_color(&peer.transport),
+                    color_bg(),
+                ),
+            ]));
+            lines.push(Line::from(format!(
+                "{} @{}",
+                peer.display_name,
+                short_id(&peer.peer_id)
+            )));
+            lines.push(Line::from(Span::styled(
+                peer.address.clone(),
+                Style::default().fg(color_subtle()),
+            )));
+        }
+
+        lines
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "Starting Voicers",
+                Style::default()
+                    .fg(color_text())
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from("Preparing the local daemon and waiting for a shareable invite."),
+            Line::from(""),
+            Line::from("If this takes a while, check the Activity panel below."),
+        ]
+    };
+
+    let widget = Paragraph::new(lines)
+        .block(panel_block("Invite", color_panel_alt()))
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, area);
 }
@@ -1159,93 +1134,6 @@ fn draw_peer_list(frame: &mut Frame, app: &UiApp, area: Rect) {
         )
         .highlight_symbol(" > ");
     frame.render_stateful_widget(list, area, &mut state);
-}
-
-fn draw_peer_details(frame: &mut Frame, app: &UiApp, area: Rect) {
-    let lines = if let Some(peer) = app.selected_peer() {
-        vec![
-            Line::from(vec![
-                Span::styled(
-                    peer.display_name.clone(),
-                    Style::default()
-                        .fg(color_text())
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                badge(
-                    media_state_label(&peer.media),
-                    media_state_color(&peer.media),
-                    color_bg(),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    format!("@{}", short_id(&peer.peer_id)),
-                    Style::default().fg(color_muted()),
-                ),
-            ]),
-            Line::from(vec![
-                label("SESSION"),
-                Span::raw(" "),
-                Span::styled(
-                    session_label(&peer.session),
-                    Style::default().fg(color_text()),
-                ),
-            ]),
-            Line::from(vec![
-                label("ROUTE"),
-                Span::raw(" "),
-                Span::styled(peer.output_bus.clone(), Style::default().fg(color_text())),
-                Span::raw("    "),
-                label("ADDR"),
-                Span::raw(" "),
-                Span::styled(peer.address.clone(), Style::default().fg(color_subtle())),
-            ]),
-            Line::from(vec![
-                metric("SENT", peer.media.sent_packets.to_string()),
-                Span::raw("   "),
-                metric("RECV", peer.media.received_packets.to_string()),
-                Span::raw("   "),
-                metric(
-                    "LAST",
-                    peer.media
-                        .last_sequence
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "<none>".to_string()),
-                ),
-            ]),
-            Line::from(vec![
-                metric("TX RMS", format!("{:.4}", peer.media.tx_level_rms)),
-                Span::raw("   "),
-                metric("RX RMS", format!("{:.4}", peer.media.rx_level_rms)),
-            ]),
-            Line::from(vec![
-                metric("PACKETS", peer.media.queued_packets.to_string()),
-                Span::raw("   "),
-                metric("FRAMES", peer.media.decoded_frames.to_string()),
-                Span::raw("   "),
-                metric("SAMPLES", peer.media.queued_samples.to_string()),
-            ]),
-            Line::from(vec![
-                metric("LOST", peer.media.lost_packets.to_string()),
-                Span::raw("   "),
-                metric("LATE", peer.media.late_packets.to_string()),
-                Span::raw("   "),
-                metric("PLC", peer.media.concealed_frames.to_string()),
-                Span::raw("   "),
-                metric("DRIFT", peer.media.drift_corrections.to_string()),
-            ]),
-        ]
-    } else {
-        vec![Line::from(Span::styled(
-            "Select a peer to inspect media state",
-            Style::default().fg(color_muted()),
-        ))]
-    };
-
-    let widget = Paragraph::new(lines)
-        .block(panel_block("Member", color_panel_alt()))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(widget, area);
 }
 
 fn draw_config_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
@@ -1442,8 +1330,13 @@ fn draw_known_peer_details(frame: &mut Frame, app: &UiApp, area: Rect) {
     let lines = app
         .status
         .as_ref()
-        .and_then(|status| status.network.known_peers.get(app.selected_known_peer))
-        .map(known_peer_lines)
+        .and_then(|status| {
+            status
+                .network
+                .known_peers
+                .get(app.selected_known_peer)
+                .map(|peer| known_peer_lines(status, peer))
+        })
         .unwrap_or_else(|| {
             vec![Line::from(Span::styled(
                 "Select a known peer to inspect saved addresses",
@@ -1457,7 +1350,10 @@ fn draw_known_peer_details(frame: &mut Frame, app: &UiApp, area: Rect) {
     frame.render_widget(widget, area);
 }
 
-fn known_peer_lines(peer: &KnownPeerSummary) -> Vec<Line<'static>> {
+fn known_peer_lines(
+    status: &voicers_core::DaemonStatus,
+    peer: &KnownPeerSummary,
+) -> Vec<Line<'static>> {
     let addresses = if peer.addresses.is_empty() {
         vec![Line::from(Span::styled(
             "<no saved addresses>",
@@ -1531,9 +1427,199 @@ fn known_peer_lines(peer: &KnownPeerSummary) -> Vec<Line<'static>> {
                 Style::default().fg(color_text()),
             ),
         ]),
+        Line::from(vec![
+            label("RETRY"),
+            Span::raw(" "),
+            Span::styled(
+                "Known Peers reconnect sends the peer id, then the daemon ranks and retries saved addresses.",
+                Style::default().fg(color_text()),
+            ),
+        ]),
     ];
+    let fallback_candidates = ranked_fallback_candidates(status, peer);
+    if fallback_candidates.is_empty() {
+        lines.push(Line::from(vec![
+            label("FALLBACK"),
+            Span::raw(" "),
+            Span::styled(
+                "<no saved reconnect candidates>",
+                Style::default().fg(color_muted()),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            label("FALLBACK"),
+            Span::raw(" "),
+            Span::styled("ranked reconnect order:", Style::default().fg(color_text())),
+        ]));
+        for (index, candidate) in fallback_candidates.iter().enumerate() {
+            let badge_text = if index == 0 { "primary" } else { "retry" };
+            let badge_color = if index == 0 {
+                color_accent()
+            } else {
+                color_panel_alt()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}. ", index + 1),
+                    Style::default().fg(color_muted()),
+                ),
+                badge(badge_text, badge_color, color_bg()),
+                Span::raw(" "),
+                Span::styled(
+                    candidate.address.clone(),
+                    Style::default().fg(color_subtle()),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(
+                    format!(
+                        "{} score {} ({} ok / {} fail){}",
+                        candidate.path_label,
+                        candidate.score_delta,
+                        candidate.successes,
+                        candidate.failures,
+                        if candidate.is_last_dial {
+                            " | last successful dial"
+                        } else {
+                            ""
+                        }
+                    ),
+                    Style::default().fg(color_muted()),
+                ),
+            ]));
+        }
+    }
     lines.extend(addresses);
     lines
+}
+
+fn draw_help_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "Local Two-Daemon Test",
+                Style::default()
+                    .fg(color_text())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            badge("fallback", color_accent(), color_bg()),
+        ]),
+        Line::from(
+            "Use separate control ports and state files when you run two daemons on one machine.",
+        ),
+        Line::from(""),
+    ];
+
+    lines.extend(
+        local_fallback_test_steps(&app.control_addr)
+            .into_iter()
+            .map(Line::from),
+    );
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Simple path",
+        Style::default()
+            .fg(color_text())
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(
+        "Run the TUI, wait for your invite, and share it. The other person opens the TUI, presses Enter, and pastes the invite.",
+    ));
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "Known Peers reconnect issues JoinPeer with the selected peer id instead of one hard-coded address.",
+    ));
+    lines.push(Line::from(
+        "The daemon ranks direct and relayed saved addresses, then retries the next candidate after an outbound dial failure.",
+    ));
+    lines.push(Line::from(
+        "Use the Peer Record panel and Activity notes to watch the retry sequence live.",
+    ));
+
+    let widget = Paragraph::new(lines)
+        .block(panel_block("Help", color_accent()))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(widget, area);
+}
+
+fn draw_help_diagnostics(frame: &mut Frame, app: &UiApp, area: Rect) {
+    let lines = if let Some(status) = &app.status {
+        let mut lines = vec![
+            Line::from(vec![
+                label("CONTROL"),
+                Span::raw(" "),
+                Span::styled(app.control_addr.clone(), Style::default().fg(color_text())),
+            ]),
+            Line::from(vec![
+                label("MEDIA"),
+                Span::raw(" "),
+                Span::styled(
+                    status.network.selected_media_path.clone(),
+                    Style::default().fg(color_text()),
+                ),
+            ]),
+            Line::from(vec![
+                label("WEBRTC"),
+                Span::raw(" "),
+                Span::styled(
+                    status.network.webrtc_connection_state.clone(),
+                    Style::default().fg(color_muted()),
+                ),
+            ]),
+            Line::from(vec![
+                label("KNOWN"),
+                Span::raw(" "),
+                Span::styled(
+                    status.network.known_peers.len().to_string(),
+                    Style::default().fg(color_text()),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Path Scores",
+                Style::default()
+                    .fg(color_text())
+                    .add_modifier(Modifier::BOLD),
+            )),
+        ];
+
+        if status.network.path_scores.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No path scores recorded yet",
+                Style::default().fg(color_muted()),
+            )));
+        } else {
+            for score in &status.network.path_scores {
+                lines.push(Line::from(vec![
+                    Span::styled(score.path.clone(), Style::default().fg(color_text())),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!(
+                            "{} ({} ok / {} fail)",
+                            score.successes as i64 - score.failures as i64,
+                            score.successes,
+                            score.failures
+                        ),
+                        Style::default().fg(color_muted()),
+                    ),
+                ]));
+            }
+        }
+        lines
+    } else {
+        vec![Line::from(Span::styled(
+            "Start a daemon to inspect reconnect diagnostics",
+            Style::default().fg(color_muted()),
+        ))]
+    };
+
+    let widget = Paragraph::new(lines)
+        .block(panel_block("Diagnostics", color_panel_alt()))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(widget, area);
 }
 
 fn draw_notes(frame: &mut Frame, app: &UiApp, area: Rect) {
@@ -1569,7 +1655,7 @@ fn draw_footer(frame: &mut Frame, app: &UiApp, area: Rect) {
 fn draw_input_popup(frame: &mut Frame, app: &UiApp) {
     let area = centered_rect(70, 18, frame.area());
     let (title, value) = match app.input_mode {
-        InputMode::Dial => ("Dial Peer", app.dial_input.as_str()),
+        InputMode::Dial => ("Join With Invite", app.dial_input.as_str()),
         InputMode::Room => ("Create Room", app.room_input.as_str()),
         InputMode::ControlAddr => ("Control Address", app.control_addr.as_str()),
         InputMode::RenameSelf => ("Rename Yourself", app.rename_input.as_str()),
@@ -1603,197 +1689,4 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         Constraint::Percentage((100 - width) / 2),
     ])
     .split(vertical[1])[1]
-}
-
-fn parse_ui_config() -> UiConfig {
-    let mut control_addr = DEFAULT_CONTROL_ADDR.to_string();
-    let mut daemon_bin = default_daemon_bin();
-    let mut args = std::env::args().skip(1);
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--control-addr" => {
-                if let Some(value) = args.next() {
-                    control_addr = value;
-                }
-            }
-            "--daemon-bin" => {
-                if let Some(value) = args.next() {
-                    daemon_bin = PathBuf::from(value);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    UiConfig {
-        control_addr,
-        daemon_bin,
-    }
-}
-
-fn default_daemon_bin() -> PathBuf {
-    if let Some(path) = std::env::var_os("VOICERSD_BIN") {
-        return PathBuf::from(path);
-    }
-
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(sibling) = sibling_binary(&current_exe, "voicersd") {
-            return sibling;
-        }
-    }
-
-    PathBuf::from("voicersd")
-}
-
-fn sibling_binary(current_exe: &Path, name: &str) -> Option<PathBuf> {
-    let dir = current_exe.parent()?;
-    let mut candidate = dir.join(name);
-
-    if cfg!(windows) {
-        candidate.set_extension("exe");
-    }
-
-    Some(candidate)
-}
-
-fn short_id(peer_id: &str) -> &str {
-    peer_id.get(0..12).unwrap_or(peer_id)
-}
-
-fn transport_label(state: &PeerTransportState) -> &'static str {
-    match state {
-        PeerTransportState::Planned => "planned",
-        PeerTransportState::Connecting => "connecting",
-        PeerTransportState::Connected => "connected",
-        PeerTransportState::Disconnected => "disconnected",
-    }
-}
-
-fn session_label(state: &PeerSessionState) -> String {
-    match state {
-        PeerSessionState::None => "none".to_string(),
-        PeerSessionState::Handshaking => "handshaking".to_string(),
-        PeerSessionState::Active {
-            room_name,
-            display_name,
-        } => format!(
-            "active {} @ {}",
-            display_name,
-            room_name.clone().unwrap_or_else(|| "<no-room>".to_string())
-        ),
-    }
-}
-
-fn media_state_label(state: &PeerMediaState) -> &'static str {
-    match state.stream_state {
-        voicers_core::MediaStreamState::Idle => "idle",
-        voicers_core::MediaStreamState::Primed => "primed",
-        voicers_core::MediaStreamState::Active => "active",
-    }
-}
-
-fn panel_block<'a>(title: &'a str, accent: Color) -> Block<'a> {
-    Block::default()
-        .title(Line::from(vec![
-            Span::styled(" ", Style::default().bg(accent)),
-            Span::styled(
-                format!(" {title} "),
-                Style::default()
-                    .fg(color_text())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(color_border()))
-        .style(Style::default().bg(color_panel()).fg(color_text()))
-}
-
-fn badge(text: impl Into<String>, bg: Color, fg: Color) -> Span<'static> {
-    Span::styled(
-        format!(" {} ", text.into()),
-        Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD),
-    )
-}
-
-fn label(text: &'static str) -> Span<'static> {
-    Span::styled(
-        text,
-        Style::default()
-            .fg(color_muted())
-            .add_modifier(Modifier::BOLD),
-    )
-}
-
-fn metric(label_text: &str, value: String) -> Span<'static> {
-    Span::styled(
-        format!("{label_text} {value}"),
-        Style::default().fg(color_text()),
-    )
-}
-
-fn media_state_color(state: &PeerMediaState) -> Color {
-    match state.stream_state {
-        voicers_core::MediaStreamState::Idle => color_warn(),
-        voicers_core::MediaStreamState::Primed => color_accent_soft(),
-        voicers_core::MediaStreamState::Active => color_good(),
-    }
-}
-
-fn transport_color(state: &PeerTransportState) -> Color {
-    match state {
-        PeerTransportState::Planned => color_subtle(),
-        PeerTransportState::Connecting => color_accent_soft(),
-        PeerTransportState::Connected => color_good(),
-        PeerTransportState::Disconnected => color_warn(),
-    }
-}
-
-fn color_bg() -> Color {
-    Color::Rgb(24, 26, 30)
-}
-
-fn color_panel() -> Color {
-    Color::Rgb(32, 34, 40)
-}
-
-fn color_panel_alt() -> Color {
-    Color::Rgb(43, 45, 49)
-}
-
-fn color_selected() -> Color {
-    Color::Rgb(56, 60, 68)
-}
-
-fn color_border() -> Color {
-    Color::Rgb(62, 65, 75)
-}
-
-fn color_text() -> Color {
-    Color::Rgb(236, 238, 242)
-}
-
-fn color_muted() -> Color {
-    Color::Rgb(153, 160, 174)
-}
-
-fn color_subtle() -> Color {
-    Color::Rgb(125, 133, 150)
-}
-
-fn color_accent() -> Color {
-    Color::Rgb(88, 101, 242)
-}
-
-fn color_accent_soft() -> Color {
-    Color::Rgb(88, 166, 255)
-}
-
-fn color_good() -> Color {
-    Color::Rgb(59, 165, 93)
-}
-
-fn color_warn() -> Color {
-    Color::Rgb(237, 66, 69)
 }

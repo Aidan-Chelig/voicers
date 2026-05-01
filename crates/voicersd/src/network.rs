@@ -1,7 +1,11 @@
+#[path = "network/media_transport.rs"]
+mod media_transport;
+#[path = "network/stun.rs"]
+mod stun;
+
 use std::{
-    collections::HashSet,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    collections::{HashMap, HashSet},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -11,18 +15,23 @@ use libp2p::{
     request_response, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, upnp, yamux, Multiaddr,
     PeerId, StreamProtocol, SwarmBuilder,
 };
-use tokio::{
-    net::{lookup_host, UdpSocket},
-    sync::{mpsc, oneshot, RwLock},
-    time::timeout,
-};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use voicers_core::{
-    DaemonStatus, KnownPeerSummary, MediaRequest, MediaResponse, MediaStreamState,
-    PathScoreSummary, PeerMediaState, PeerSessionState, PeerSummary, PeerTransportState,
-    SessionHello, SessionRequest, SessionResponse, WebRtcSignal,
+    encode_compact_invite, DaemonStatus, KnownPeerSummary, MediaRequest, MediaResponse,
+    MediaStreamState, PathScoreSummary, PeerMediaState, PeerSessionState, PeerSummary,
+    PeerTransportState, SessionHello, SessionRequest, SessionResponse, WebRtcSignal,
 };
 
 use std::sync::Arc;
+
+use self::media_transport::{
+    address_path_name, resolve_ranked_dial_target, select_media_path, send_frame_libp2p,
+};
+#[cfg(feature = "webrtc-transport")]
+use self::media_transport::{
+    handle_incoming_webrtc_frame, handle_webrtc_connection_state, send_frame_with_fallback,
+};
+use self::stun::run_stun_probes;
 
 #[cfg(feature = "webrtc-transport")]
 use crate::webrtc_transport::{
@@ -34,7 +43,6 @@ const PROTOCOL_VERSION: &str = "/voicers/0.1.0";
 const SESSION_PROTOCOL: StreamProtocol = StreamProtocol::new("/voicers/session/0.1.0");
 const MEDIA_PROTOCOL: StreamProtocol = StreamProtocol::new("/voicers/media/0.1.0");
 const MAX_AUTO_RELAY_CANDIDATES: usize = 4;
-const STUN_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_BOOTSTRAP_ADDRS: &[&str] = &[
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
@@ -47,12 +55,6 @@ const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun1.l.google.com:19302",
     "stun.cloudflare.com:3478",
 ];
-const STUN_BINDING_REQUEST: u16 = 0x0001;
-const STUN_BINDING_SUCCESS_RESPONSE: u16 = 0x0101;
-const STUN_ATTR_MAPPED_ADDRESS: u16 = 0x0001;
-const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
-const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
-
 fn relay_reservation_addr(mut relay_addr: Multiaddr) -> Result<Multiaddr> {
     let has_relay_peer = relay_addr
         .iter()
@@ -89,189 +91,18 @@ fn relay_addr_for_peer(address: Multiaddr, peer_id: PeerId) -> Multiaddr {
     }
 }
 
-async fn run_stun_probes(state: Arc<RwLock<DaemonStatus>>, servers: Vec<String>) {
-    for server in servers {
-        match probe_stun_server(&server).await {
-            Ok(mapped_addr) => {
-                let rendered = format!("stun:{server} -> {mapped_addr}");
-                let mut state = state.write().await;
-                insert_unique_addr(&mut state.network.stun_addrs, rendered.clone());
-                state.network.nat_status = format!("STUN reflexive UDP endpoint {mapped_addr}");
-                insert_unique_note(&mut state, format!("STUN observed {rendered}"));
-            }
-            Err(error) => {
-                push_note(
-                    &state,
-                    format!("STUN probe failed against {server}: {error:#}"),
-                )
-                .await;
-            }
-        }
-    }
-}
-
-async fn probe_stun_server(server: &str) -> Result<SocketAddr> {
-    let mut resolved = lookup_host(server)
-        .await
-        .with_context(|| format!("failed to resolve STUN server {server}"))?;
-    let server_addr = resolved
-        .next()
-        .with_context(|| format!("STUN server {server} did not resolve to an address"))?;
-    let bind_addr = if server_addr.is_ipv4() {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-    } else {
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-    };
-    let socket = UdpSocket::bind(bind_addr)
-        .await
-        .context("failed to bind UDP socket for STUN probe")?;
-
-    let transaction_id = stun_transaction_id();
-    let request = stun_binding_request(transaction_id);
-    socket
-        .send_to(&request, server_addr)
-        .await
-        .with_context(|| format!("failed to send STUN request to {server_addr}"))?;
-
-    let mut response = [0u8; 1500];
-    let (len, _) = timeout(STUN_TIMEOUT, socket.recv_from(&mut response))
-        .await
-        .with_context(|| format!("timed out waiting for STUN response from {server_addr}"))?
-        .context("failed to receive STUN response")?;
-
-    parse_stun_binding_response(&response[..len], transaction_id)
-}
-
-fn stun_transaction_id() -> [u8; 12] {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let pid = u128::from(std::process::id());
-    let mixed = nanos ^ pid.rotate_left(17);
-    let bytes = mixed.to_be_bytes();
-    let mut transaction_id = [0u8; 12];
-    transaction_id.copy_from_slice(&bytes[4..16]);
-    transaction_id
-}
-
-fn stun_binding_request(transaction_id: [u8; 12]) -> [u8; 20] {
-    let mut request = [0u8; 20];
-    request[0..2].copy_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
-    request[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-    request[8..20].copy_from_slice(&transaction_id);
-    request
-}
-
-fn parse_stun_binding_response(response: &[u8], transaction_id: [u8; 12]) -> Result<SocketAddr> {
-    if response.len() < 20 {
-        anyhow::bail!("STUN response is shorter than the header");
-    }
-
-    let message_type = u16::from_be_bytes([response[0], response[1]]);
-    if message_type != STUN_BINDING_SUCCESS_RESPONSE {
-        anyhow::bail!("unexpected STUN response type 0x{message_type:04x}");
-    }
-
-    let message_length = usize::from(u16::from_be_bytes([response[2], response[3]]));
-    if response.len() < 20 + message_length {
-        anyhow::bail!("truncated STUN response");
-    }
-
-    let magic_cookie = u32::from_be_bytes([response[4], response[5], response[6], response[7]]);
-    if magic_cookie != STUN_MAGIC_COOKIE {
-        anyhow::bail!("unexpected STUN magic cookie");
-    }
-
-    if response[8..20] != transaction_id {
-        anyhow::bail!("STUN transaction id mismatch");
-    }
-
-    let attrs = &response[20..20 + message_length];
-    let mut mapped_addr = None;
-    let mut offset = 0usize;
-    while offset + 4 <= attrs.len() {
-        let attr_type = u16::from_be_bytes([attrs[offset], attrs[offset + 1]]);
-        let attr_len = usize::from(u16::from_be_bytes([attrs[offset + 2], attrs[offset + 3]]));
-        let value_start = offset + 4;
-        let value_end = value_start + attr_len;
-        if value_end > attrs.len() {
-            anyhow::bail!("truncated STUN attribute");
-        }
-
-        let value = &attrs[value_start..value_end];
-        match attr_type {
-            STUN_ATTR_XOR_MAPPED_ADDRESS => {
-                return parse_stun_address(value, true, transaction_id);
-            }
-            STUN_ATTR_MAPPED_ADDRESS => {
-                mapped_addr = Some(parse_stun_address(value, false, transaction_id)?);
-            }
-            _ => {}
-        }
-
-        offset = value_start + padded_stun_attr_len(attr_len);
-    }
-
-    mapped_addr.context("STUN response did not include a mapped address")
-}
-
-fn parse_stun_address(value: &[u8], xor: bool, transaction_id: [u8; 12]) -> Result<SocketAddr> {
-    if value.len() < 4 || value[0] != 0 {
-        anyhow::bail!("invalid STUN address attribute");
-    }
-
-    let family = value[1];
-    let mut port = u16::from_be_bytes([value[2], value[3]]);
-    if xor {
-        port ^= (STUN_MAGIC_COOKIE >> 16) as u16;
-    }
-
-    match family {
-        0x01 => {
-            if value.len() < 8 {
-                anyhow::bail!("truncated STUN IPv4 address");
-            }
-            let mut octets = [value[4], value[5], value[6], value[7]];
-            if xor {
-                let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
-                for (octet, mask) in octets.iter_mut().zip(cookie) {
-                    *octet ^= mask;
-                }
-            }
-            Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(octets)), port))
-        }
-        0x02 => {
-            if value.len() < 20 {
-                anyhow::bail!("truncated STUN IPv6 address");
-            }
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&value[4..20]);
-            if xor {
-                let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
-                for (octet, mask) in octets.iter_mut().take(4).zip(cookie) {
-                    *octet ^= mask;
-                }
-                for (octet, mask) in octets.iter_mut().skip(4).zip(transaction_id) {
-                    *octet ^= mask;
-                }
-            }
-            Ok(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port))
-        }
-        _ => anyhow::bail!("unsupported STUN address family {family}"),
-    }
-}
-
-fn padded_stun_attr_len(len: usize) -> usize {
-    (len + 3) & !3
-}
-
 #[derive(Clone)]
 pub struct NetworkHandle {
     command_tx: mpsc::Sender<NetworkCommand>,
 }
 
 impl NetworkHandle {
+    pub fn noop() -> Self {
+        let (command_tx, command_rx) = mpsc::channel(1);
+        drop(command_rx);
+        Self { command_tx }
+    }
+
     pub async fn dial(&self, address: String) -> Result<String> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -336,6 +167,12 @@ pub struct NetworkBootstrap {
     pub handle: NetworkHandle,
 }
 
+#[derive(Debug, Clone)]
+struct PendingDial {
+    current_address: String,
+    fallback_addresses: Vec<String>,
+}
+
 enum NetworkCommand {
     Dial {
         address: String,
@@ -376,6 +213,7 @@ pub fn start(
     listen_addr: &str,
     relay_addr: Option<&str>,
     bootstrap_addrs: &[String],
+    use_default_bootstrap_addrs: bool,
     stun_servers: &[String],
     enable_stun: bool,
     #[cfg(feature = "webrtc-transport")] webrtc: Option<WebRtcHandle>,
@@ -445,7 +283,8 @@ pub fn start(
             .with_context(|| format!("failed to reserve relay address {reservation_addr}"))?;
     }
 
-    let bootstrap_sources: Vec<&str> = if bootstrap_addrs.is_empty() {
+    let bootstrap_sources: Vec<&str> = if bootstrap_addrs.is_empty() && use_default_bootstrap_addrs
+    {
         DEFAULT_BOOTSTRAP_ADDRS.to_vec()
     } else {
         bootstrap_addrs.iter().map(String::as_str).collect()
@@ -519,6 +358,7 @@ async fn run_network_task(
 ) {
     let mut active_media_flows = HashSet::new();
     let mut attempted_relays = HashSet::new();
+    let mut pending_dials = HashMap::new();
 
     loop {
         tokio::select! {
@@ -528,6 +368,7 @@ async fn run_network_task(
                     &mut swarm,
                     &command_tx,
                     &mut active_media_flows,
+                    &mut pending_dials,
                     &media,
                     command,
                 ).await;
@@ -539,6 +380,7 @@ async fn run_network_task(
                     &command_tx,
                     &mut active_media_flows,
                     &mut attempted_relays,
+                    &mut pending_dials,
                     &media,
                     &persistence,
                     event,
@@ -563,6 +405,7 @@ async fn run_network_task(
 ) {
     let mut active_media_flows = HashSet::new();
     let mut attempted_relays = HashSet::new();
+    let mut pending_dials = HashMap::new();
 
     loop {
         tokio::select! {
@@ -572,6 +415,7 @@ async fn run_network_task(
                     &mut swarm,
                     &command_tx,
                     &mut active_media_flows,
+                    &mut pending_dials,
                     &webrtc,
                     &media,
                     command,
@@ -599,6 +443,7 @@ async fn run_network_task(
                     &command_tx,
                     &mut active_media_flows,
                     &mut attempted_relays,
+                    &mut pending_dials,
                     &webrtc,
                     &media,
                     &persistence,
@@ -614,6 +459,7 @@ async fn handle_command(
     swarm: &mut libp2p::Swarm<VoicersBehaviour>,
     command_tx: &mpsc::Sender<NetworkCommand>,
     active_media_flows: &mut HashSet<String>,
+    pending_dials: &mut HashMap<String, PendingDial>,
     #[cfg(feature = "webrtc-transport")] webrtc: &Option<WebRtcHandle>,
     media: &MediaHandle,
     command: NetworkCommand,
@@ -623,7 +469,7 @@ async fn handle_command(
             address,
             response_tx,
         } => {
-            let response = dial_peer(state, swarm, &address).await;
+            let response = dial_peer(state, swarm, pending_dials, &address).await;
             let _ = response_tx.send(response);
         }
         NetworkCommand::BroadcastSessionHello { hello, response_tx } => {
@@ -667,16 +513,43 @@ async fn handle_command(
 async fn dial_peer(
     state: &Arc<RwLock<DaemonStatus>>,
     swarm: &mut libp2p::Swarm<VoicersBehaviour>,
+    pending_dials: &mut HashMap<String, PendingDial>,
     address: &str,
 ) -> Result<String> {
-    let multiaddr: Multiaddr = address
+    let ranked = {
+        let state = state.read().await;
+        resolve_ranked_dial_target(&state.network, address)
+    };
+
+    let multiaddr: Multiaddr = ranked
+        .primary
         .parse()
-        .with_context(|| format!("invalid multiaddr: {address}"))?;
+        .with_context(|| format!("invalid multiaddr: {}", ranked.primary))?;
 
     swarm
         .dial(multiaddr.clone())
         .with_context(|| format!("failed to dial {multiaddr}"))?;
-    push_note(state, format!("dialing {multiaddr}")).await;
+    if let Some(peer_id) = ranked.peer_id {
+        pending_dials.insert(
+            peer_id,
+            PendingDial {
+                current_address: ranked.primary.clone(),
+                fallback_addresses: ranked.fallbacks.clone(),
+            },
+        );
+    }
+    if ranked.fallbacks.is_empty() {
+        push_note(state, format!("dialing {multiaddr}")).await;
+    } else {
+        push_note(
+            state,
+            format!(
+                "dialing {multiaddr}; ranked fallbacks: {}",
+                ranked.fallbacks.join(", ")
+            ),
+        )
+        .await;
+    }
 
     Ok(format!("dialing {multiaddr}"))
 }
@@ -748,6 +621,7 @@ async fn handle_swarm_event(
     command_tx: &mpsc::Sender<NetworkCommand>,
     active_media_flows: &mut HashSet<String>,
     attempted_relays: &mut HashSet<PeerId>,
+    pending_dials: &mut HashMap<String, PendingDial>,
     #[cfg(feature = "webrtc-transport")] webrtc: &Option<WebRtcHandle>,
     media: &MediaHandle,
     persistence: &PersistenceHandle,
@@ -804,6 +678,7 @@ async fn handle_swarm_event(
         SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
         } => {
+            pending_dials.remove(&peer_id.to_string());
             let address = endpoint.get_remote_address().to_string();
             let local_hello = {
                 let state = state.read().await;
@@ -873,18 +748,71 @@ async fn handle_swarm_event(
             persist_network_snapshot(state, persistence).await;
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-            let mut state = state.write().await;
+            let mut status = state.write().await;
             let peer_label = peer_id.map(|peer| peer.to_string());
-            record_path_score(&mut state, "libp2p-direct", peer_label.clone(), false);
+            let failed_path = peer_label
+                .as_ref()
+                .and_then(|peer| pending_dials.get(peer))
+                .map(|pending| address_path_name(&pending.current_address))
+                .unwrap_or("libp2p-direct");
+            record_path_score(&mut status, failed_path, peer_label.clone(), false);
             insert_unique_note(
-                &mut state,
+                &mut status,
                 format!(
                     "outgoing connection error{}: {error}",
                     peer_label
+                        .as_deref()
                         .map(|peer| format!(" for {peer}"))
                         .unwrap_or_default()
                 ),
             );
+            let next_retry = peer_label.as_ref().and_then(|peer| {
+                let pending = pending_dials.get_mut(peer)?;
+                let next = pending.fallback_addresses.first().cloned()?;
+                pending.fallback_addresses.remove(0);
+                pending.current_address = next.clone();
+                Some((peer.clone(), next, pending.fallback_addresses.clone()))
+            });
+            drop(status);
+            if let Some((peer, next_address, remaining)) = next_retry {
+                match next_address.parse::<Multiaddr>() {
+                    Ok(multiaddr) => {
+                        if swarm.dial(multiaddr.clone()).is_ok() {
+                            if remaining.is_empty() {
+                                push_note(
+                                    state,
+                                    format!("retrying {peer} via fallback {multiaddr}"),
+                                )
+                                .await;
+                            } else {
+                                push_note(
+                                    state,
+                                    format!(
+                                        "retrying {peer} via fallback {multiaddr}; remaining fallbacks: {}",
+                                        remaining.join(", ")
+                                    ),
+                                )
+                                .await;
+                            }
+                        } else {
+                            push_note(
+                                state,
+                                format!("fallback dial setup failed for {peer} via {multiaddr}"),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(parse_error) => {
+                        push_note(
+                            state,
+                            format!(
+                                "skipping invalid fallback dial address for {peer}: {next_address} ({parse_error})"
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
         }
         SwarmEvent::Behaviour(VoicersBehaviourEvent::Identify(identify::Event::Received {
             peer_id,
@@ -1258,8 +1186,9 @@ async fn handle_swarm_event(
                         let mut state = state.write().await;
                         state.network.transport_stage =
                             "tcp+noise+yamux active; direct media transport active".to_string();
-                        state.network.selected_media_path = "libp2p-request-response".to_string();
                     }
+                    select_media_path(state, media_transport::MediaPath::Libp2pRequestResponse)
+                        .await;
                     schedule_media_tick(command_tx.clone(), peer.to_string());
                     push_note(state, format!("media flow started for {peer}")).await;
                 }
@@ -1371,7 +1300,7 @@ async fn send_next_media_frame(
     media: &MediaHandle,
     peer_id: &str,
 ) {
-    send_next_media_frame_libp2p(state, swarm, media, peer_id).await;
+    send_frame_libp2p(state, swarm, media, peer_id).await;
 }
 
 #[cfg(feature = "webrtc-transport")]
@@ -1382,148 +1311,7 @@ async fn send_next_media_frame_webrtc_first(
     media: &MediaHandle,
     peer_id: &str,
 ) {
-    send_next_media_frame_with_webrtc(state, swarm, webrtc.as_ref(), media, peer_id).await;
-}
-
-#[cfg(feature = "webrtc-transport")]
-async fn send_next_media_frame_with_webrtc(
-    state: &Arc<RwLock<DaemonStatus>>,
-    swarm: &mut libp2p::Swarm<VoicersBehaviour>,
-    webrtc: Option<&WebRtcHandle>,
-    media: &MediaHandle,
-    peer_id: &str,
-) {
-    if let Ok(peer) = peer_id.parse() {
-        match media.build_next_audio_frame(peer_id.to_string()).await {
-            Ok(frame) => {
-                #[cfg(feature = "webrtc-transport")]
-                if let Some(webrtc) = webrtc {
-                    if webrtc
-                        .send_media_frame(peer_id.to_string(), frame.clone())
-                        .await
-                        .is_ok()
-                    {
-                        let mut state = state.write().await;
-                        state.network.transport_stage =
-                            "webrtc data-channel media active; libp2p signalling fallback ready"
-                                .to_string();
-                        state.network.selected_media_path = "webrtc-data-channel".to_string();
-                        return;
-                    }
-                }
-                {
-                    let mut state = state.write().await;
-                    state.network.selected_media_path = "libp2p-request-response".to_string();
-                }
-                swarm
-                    .behaviour_mut()
-                    .media
-                    .send_request(&peer, MediaRequest::Frame(frame));
-            }
-            Err(error) => {
-                push_note(
-                    state,
-                    format!("failed to build audio frame for {peer_id}: {error}"),
-                )
-                .await;
-            }
-        }
-    }
-}
-
-#[cfg(not(feature = "webrtc-transport"))]
-async fn send_next_media_frame_libp2p(
-    state: &Arc<RwLock<DaemonStatus>>,
-    swarm: &mut libp2p::Swarm<VoicersBehaviour>,
-    media: &MediaHandle,
-    peer_id: &str,
-) {
-    if let Ok(peer) = peer_id.parse() {
-        match media.build_next_audio_frame(peer_id.to_string()).await {
-            Ok(frame) => {
-                swarm
-                    .behaviour_mut()
-                    .media
-                    .send_request(&peer, MediaRequest::Frame(frame));
-            }
-            Err(error) => {
-                push_note(
-                    state,
-                    format!("failed to build audio frame for {peer_id}: {error}"),
-                )
-                .await;
-            }
-        }
-    }
-}
-
-#[cfg(feature = "webrtc-transport")]
-async fn handle_webrtc_media_frame(
-    state: &Arc<RwLock<DaemonStatus>>,
-    media: &MediaHandle,
-    incoming: IncomingWebRtcMediaFrame,
-) {
-    match media
-        .handle_incoming_frame(incoming.peer_id.clone(), incoming.frame)
-        .await
-    {
-        Ok(_) => {
-            let mut state = state.write().await;
-            state.network.transport_stage =
-                "webrtc data-channel media active; receiving remote Opus frames".to_string();
-            state.network.selected_media_path = "webrtc-data-channel".to_string();
-        }
-        Err(error) => {
-            push_note(
-                state,
-                format!(
-                    "WebRTC media handling failed for {}: {error}",
-                    incoming.peer_id
-                ),
-            )
-            .await;
-        }
-    }
-}
-
-#[cfg(feature = "webrtc-transport")]
-async fn handle_webrtc_connection_state(
-    state: &Arc<RwLock<DaemonStatus>>,
-    persistence: &PersistenceHandle,
-    update: WebRtcConnectionStateUpdate,
-) {
-    {
-        let mut state = state.write().await;
-        state.network.webrtc_connection_state = format!("{} {}", update.peer_id, update.state);
-        match update.state.as_str() {
-            "connected" => {
-                state.network.selected_media_path = "webrtc-data-channel".to_string();
-                record_path_score(
-                    &mut state,
-                    "webrtc-data-channel",
-                    Some(update.peer_id.clone()),
-                    true,
-                );
-            }
-            "failed" | "closed" => {
-                record_path_score(
-                    &mut state,
-                    "webrtc-data-channel",
-                    Some(update.peer_id.clone()),
-                    false,
-                );
-            }
-            _ => {}
-        }
-        insert_unique_note(
-            &mut state,
-            format!(
-                "WebRTC connection with {} is {}",
-                update.peer_id, update.state
-            ),
-        );
-    }
-    persist_network_snapshot(state, persistence).await;
+    send_frame_with_fallback(state, swarm, webrtc.as_ref(), media, peer_id).await;
 }
 
 fn schedule_media_tick(command_tx: mpsc::Sender<NetworkCommand>, peer_id: String) {
@@ -1754,7 +1542,7 @@ fn update_known_peer(
         return;
     }
 
-    let normalized_addr = address.and_then(|addr| shareable_invite(&addr, peer_id));
+    let normalized_addr = address.and_then(|addr| shareable_address(&addr, peer_id));
 
     let entry = if let Some(existing) = state
         .network
@@ -1802,11 +1590,15 @@ fn best_share_invite(
     ]
     .into_iter()
     .flat_map(|addresses| addresses.iter())
-    .filter_map(|address| shareable_invite(address, local_peer_id))
+    .filter_map(|address| compact_share_invite(address, local_peer_id))
     .next()
 }
 
-fn shareable_invite(address: &str, local_peer_id: &str) -> Option<String> {
+fn compact_share_invite(address: &str, local_peer_id: &str) -> Option<String> {
+    shareable_address(address, local_peer_id).map(|address| encode_compact_invite(&address))
+}
+
+fn shareable_address(address: &str, local_peer_id: &str) -> Option<String> {
     if local_peer_id == "<starting>" || local_peer_id.is_empty() {
         return None;
     }
@@ -1864,37 +1656,4 @@ async fn persist_network_snapshot(
 
 fn short_peer_id(peer_id: &str) -> &str {
     peer_id.get(0..12).unwrap_or(peer_id)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_xor_mapped_ipv4_stun_response() {
-        let transaction_id = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-        let public_ip = Ipv4Addr::new(203, 0, 113, 45);
-        let public_port = 54_321u16;
-        let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
-        let xport = public_port ^ (STUN_MAGIC_COOKIE >> 16) as u16;
-        let mut xaddr = public_ip.octets();
-        for (octet, mask) in xaddr.iter_mut().zip(cookie) {
-            *octet ^= mask;
-        }
-
-        let mut response = Vec::new();
-        response.extend_from_slice(&STUN_BINDING_SUCCESS_RESPONSE.to_be_bytes());
-        response.extend_from_slice(&12u16.to_be_bytes());
-        response.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-        response.extend_from_slice(&transaction_id);
-        response.extend_from_slice(&STUN_ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
-        response.extend_from_slice(&8u16.to_be_bytes());
-        response.push(0);
-        response.push(0x01);
-        response.extend_from_slice(&xport.to_be_bytes());
-        response.extend_from_slice(&xaddr);
-
-        let parsed = parse_stun_binding_response(&response, transaction_id).unwrap();
-        assert_eq!(parsed, SocketAddr::new(IpAddr::V4(public_ip), public_port));
-    }
 }

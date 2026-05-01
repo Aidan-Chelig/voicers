@@ -16,6 +16,7 @@ license = "MIT"
 anyhow = "1.0.102"
 audiopus = "0.3.0-rc.0"
 audiopus_sys = { version = "0.2.2", features = ["static"] }
+base64 = "0.22.1"
 bytes = "1.11.0"
 cpal = "0.15.3"
 crossterm = "0.29.0"

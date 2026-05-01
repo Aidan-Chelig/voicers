@@ -26,7 +26,3 @@ webrtc = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 pipewire.workspace = true
-
-[dev-dependencies]
-webrtc-ice.workspace = true
-webrtc-util.workspace = true

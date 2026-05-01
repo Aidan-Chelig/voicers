@@ -107,6 +107,9 @@ Current state:
   connecting, failed, or closed.
 - Done: daemon status exposes `selected_media_path`, `webrtc_connection_state`,
   and persisted path score counters.
+- Done: an internal media-transport boundary now owns path naming, WebRTC-first
+  fallback policy, and path-status updates instead of branching directly inside
+  the media tick loop.
 
 Unification target:
 
