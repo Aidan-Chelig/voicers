@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -18,12 +19,15 @@ pub struct UiApp {
     pub screen: Screen,
     pub previous_screen: Screen,
     pub selected_peer: usize,
+    pub selected_main_item: usize,
     pub selected_config_item: usize,
     pub selected_known_peer: usize,
     pub selected_seen_user: usize,
     pub selected_discovered_peer: usize,
     pub selected_room: usize,
     pub selected_call: usize,
+    pub expanded_main_rooms: HashSet<String>,
+    pub expanded_main_calls: bool,
     pub daemon_launch: DaemonLaunchState,
     pub default_room_initialized: bool,
 }
@@ -69,6 +73,24 @@ pub struct KnownRoomPreview {
     pub is_current: bool,
 }
 
+#[derive(Clone)]
+pub enum MainActivityItem {
+    RoomGroup {
+        room_name: String,
+        engaged_users: usize,
+    },
+    RoomPeer {
+        room_name: String,
+        peer: PeerSummary,
+    },
+    CallsGroup {
+        active_calls: usize,
+    },
+    CallPeer {
+        peer: PeerSummary,
+    },
+}
+
 pub enum ConfigItem {
     InputGain,
     CaptureDevice(String),
@@ -101,12 +123,15 @@ impl UiApp {
             screen: Screen::Main,
             previous_screen: Screen::Main,
             selected_peer: 0,
+            selected_main_item: 0,
             selected_config_item: 0,
             selected_known_peer: 0,
             selected_seen_user: 0,
             selected_discovered_peer: 0,
             selected_room: 0,
             selected_call: 0,
+            expanded_main_rooms: HashSet::new(),
+            expanded_main_calls: true,
             daemon_launch: DaemonLaunchState::default(),
             default_room_initialized: false,
         }
@@ -173,6 +198,19 @@ impl UiApp {
             self.selected_config_item = 0;
         } else if self.selected_config_item >= len {
             self.selected_config_item = len - 1;
+        }
+    }
+
+    pub fn clamp_main_selection(&mut self) {
+        let len = self
+            .status
+            .as_ref()
+            .map(|status| main_activity_items(status, &self.expanded_main_rooms, self.expanded_main_calls).len())
+            .unwrap_or(0);
+        if len == 0 {
+            self.selected_main_item = 0;
+        } else if self.selected_main_item >= len {
+            self.selected_main_item = len - 1;
         }
     }
 
@@ -295,7 +333,7 @@ pub fn visible_voice_peers(status: &DaemonStatus) -> Vec<&PeerSummary> {
 
 pub fn default_flash(screen: Screen) -> &'static str {
     match screen {
-        Screen::Main => "rooms | ? keybinds | J join invite | Enter enter room",
+        Screen::Main => "main | ? keybinds | j/k move | Enter toggle/open | J join invite",
         Screen::Peers => "engaged users | ? keybinds | x mute | a add friend",
         Screen::Rooms => "rooms | ? keybinds | J join invite | Enter enter room",
         Screen::Calls => "calls | ? keybinds | x mute | a add friend",
@@ -305,6 +343,57 @@ pub fn default_flash(screen: Screen) -> &'static str {
         Screen::DiscoveredPeers => "network peers | ? keybinds | Enter inspect route candidate",
         Screen::Help => "? or esc closes help",
     }
+}
+
+pub fn main_activity_items(
+    status: &DaemonStatus,
+    expanded_rooms: &HashSet<String>,
+    expanded_calls: bool,
+) -> Vec<MainActivityItem> {
+    let mut items = Vec::new();
+    let engaged_rooms: Vec<String> = status
+        .rooms
+        .iter()
+        .filter(|room| room.engaged)
+        .map(|room| room.name.clone())
+        .collect();
+
+    for room_name in engaged_rooms {
+        let room_peers: Vec<PeerSummary> = visible_voice_peers(status)
+            .into_iter()
+            .filter(|peer| match &peer.session {
+                PeerSessionState::Active { room_name: peer_room, .. } => {
+                    peer_room.as_deref().unwrap_or("main") == room_name
+                }
+                _ => false,
+            })
+            .cloned()
+            .collect();
+        items.push(MainActivityItem::RoomGroup {
+            room_name: room_name.clone(),
+            engaged_users: room_peers.len(),
+        });
+        if expanded_rooms.contains(&room_name) {
+            for peer in room_peers {
+                items.push(MainActivityItem::RoomPeer {
+                    room_name: room_name.clone(),
+                    peer,
+                });
+            }
+        }
+    }
+
+    let calls: Vec<PeerSummary> = active_call_peers(status).into_iter().cloned().collect();
+    items.push(MainActivityItem::CallsGroup {
+        active_calls: calls.len(),
+    });
+    if expanded_calls {
+        for peer in calls {
+            items.push(MainActivityItem::CallPeer { peer });
+        }
+    }
+
+    items
 }
 
 pub fn active_call_peers(status: &DaemonStatus) -> Vec<&PeerSummary> {
