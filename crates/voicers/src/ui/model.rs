@@ -338,7 +338,7 @@ pub fn default_flash(screen: Screen) -> &'static str {
         Screen::Rooms => "rooms | ? keybinds | J join invite | Enter enter room",
         Screen::Calls => "calls | ? keybinds | x mute | a add friend",
         Screen::Config => "configuration | ? keybinds | h/l adjust | Enter activate",
-        Screen::KnownPeers => "friends | ? keybinds | Enter reconnect | D remove",
+        Screen::KnownPeers => "friends | ? keybinds | Enter reconnect | D remove | t trust toggle",
         Screen::SeenUsers => "seen users | ? keybinds | Enter reconnect | a add friend",
         Screen::DiscoveredPeers => "network peers | ? keybinds | Enter inspect route candidate",
         Screen::Help => "? or esc closes help",
@@ -679,6 +679,7 @@ mod tests {
                 pinned: true,
                 seen: true,
                 whitelisted: false,
+                trusted_contact: false,
             }],
         );
 
@@ -702,6 +703,7 @@ mod tests {
                 pinned: true,
                 seen: true,
                 whitelisted: false,
+                trusted_contact: false,
             }],
         );
 
@@ -756,6 +758,7 @@ mod tests {
                 decoded_frames: 0,
                 queued_samples: 0,
                 last_sequence: None,
+                route_via: None,
             },
         });
 

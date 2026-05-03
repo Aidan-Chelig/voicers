@@ -622,11 +622,6 @@ async fn handle_known_peers_screen(app: &mut UiApp, key: KeyCode) -> Result<bool
             app.clamp_seen_user_selection();
             app.set_flash(default_flash(Screen::SeenUsers));
         }
-        KeyCode::Char('t') => {
-            app.screen = Screen::DiscoveredPeers;
-            app.clamp_discovered_peer_selection();
-            app.set_flash(default_flash(Screen::DiscoveredPeers));
-        }
         KeyCode::Char('u') => {
             app.rename_input = app
                 .status
@@ -665,6 +660,9 @@ async fn handle_known_peers_screen(app: &mut UiApp, key: KeyCode) -> Result<bool
         }
         KeyCode::Char('D') => {
             forget_selected_known_peer(app).await;
+        }
+        KeyCode::Char('t') => {
+            toggle_trusted_contact(app).await;
         }
         KeyCode::Char('r') => {
             if let Some(peer) = app.selected_known_peer() {
@@ -1222,6 +1220,27 @@ async fn forget_selected_known_peer(app: &mut UiApp) {
         ControlRequest::ForgetKnownPeer { peer_id },
     )
     .await;
+    app.set_flash(render_message(response));
+    refresh_status(app).await;
+}
+
+async fn toggle_trusted_contact(app: &mut UiApp) {
+    let Some(peer) = app.selected_known_peer().cloned() else {
+        app.set_flash("no friend selected");
+        return;
+    };
+
+    let request = if peer.trusted_contact {
+        ControlRequest::UnmarkTrustedContact {
+            peer_id: peer.peer_id.clone(),
+        }
+    } else {
+        ControlRequest::MarkTrustedContact {
+            peer_id: peer.peer_id.clone(),
+        }
+    };
+
+    let response = client::send_request_to(&app.control_addr, request).await;
     app.set_flash(render_message(response));
     refresh_status(app).await;
 }
@@ -2287,6 +2306,16 @@ fn draw_live_peers_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
             visible_peers
                 .into_iter()
                 .map(|peer| {
+                    let relay_label = peer.media.route_via.as_deref().map(|via_id| {
+                        let name = status
+                            .network
+                            .known_peers
+                            .iter()
+                            .find(|k| k.peer_id == via_id)
+                            .map(|k| k.display_name.clone())
+                            .unwrap_or_else(|| format!("@{}", &via_id[..via_id.len().min(8)]));
+                        format!("via @{name}")
+                    });
                     ListItem::new(vec![
                         Line::from(vec![
                             Span::styled(
@@ -2311,6 +2340,7 @@ fn draw_live_peers_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
                                 },
                                 color_bg(),
                             ),
+                            Span::raw(relay_label.map(|l| format!("  {l}")).unwrap_or_default()),
                         ]),
                         Line::from(vec![
                             Span::styled(
@@ -2509,6 +2539,16 @@ fn draw_calls_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
                         voicers_core::PeerSessionState::Handshaking => "handshaking".to_string(),
                         voicers_core::PeerSessionState::None => "transport".to_string(),
                     };
+                    let relay_label = peer.media.route_via.as_deref().map(|via_id| {
+                        let name = status
+                            .network
+                            .known_peers
+                            .iter()
+                            .find(|k| k.peer_id == via_id)
+                            .map(|k| k.display_name.clone())
+                            .unwrap_or_else(|| format!("@{}", &via_id[..via_id.len().min(8)]));
+                        format!("via @{name}")
+                    });
                     ListItem::new(vec![
                         Line::from(vec![
                             Span::styled(
@@ -2523,6 +2563,7 @@ fn draw_calls_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
                                 transport_color(&peer.transport),
                                 color_bg(),
                             ),
+                            Span::raw(relay_label.map(|l| format!("  {l}")).unwrap_or_default()),
                         ]),
                         Line::from(vec![
                             Span::styled(
@@ -2791,6 +2832,11 @@ fn draw_known_peers_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
                                     .fg(color_text())
                                     .add_modifier(Modifier::BOLD),
                             ),
+                            if peer.trusted_contact {
+                                Span::styled(" [T]", Style::default().fg(color_accent()))
+                            } else {
+                                Span::raw("")
+                            },
                             Span::raw(" "),
                             if peer.pinned {
                                 badge("saved", color_accent(), color_bg())

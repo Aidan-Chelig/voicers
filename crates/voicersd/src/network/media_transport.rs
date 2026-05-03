@@ -2,6 +2,7 @@ use libp2p::{multiaddr::Protocol, Multiaddr};
 use tokio::sync::RwLock;
 use voicers_core::{DaemonStatus, KnownPeerSummary, NetworkSummary};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::media::MediaHandle;
@@ -53,6 +54,92 @@ enum WebRtcPathState {
     Disabled,
     Connected,
     NotConnected,
+}
+
+pub(super) enum Route {
+    Direct(libp2p::PeerId),
+    Relayed { via: libp2p::PeerId, destination: libp2p::PeerId },
+    Unreachable,
+}
+
+pub(super) fn resolve_route(
+    state: &DaemonStatus,
+    relay_offers: &HashMap<String, Vec<String>>,
+    target: &str,
+) -> Route {
+    let known = state.network.known_peers.iter().find(|p| p.peer_id == target);
+
+    if let Some(peer) = known {
+        if peer.trusted_contact && peer.connected {
+            if let Ok(pid) = target.parse() {
+                return Route::Direct(pid);
+            }
+        }
+    }
+
+    let mut candidates: Vec<(&KnownPeerSummary, i64)> = state
+        .network
+        .known_peers
+        .iter()
+        .filter(|c| {
+            c.trusted_contact
+                && c.connected
+                && relay_offers
+                    .get(&c.peer_id)
+                    .map_or(false, |list| list.iter().any(|id| id == target))
+        })
+        .map(|c| {
+            let rtt_score = state
+                .network
+                .path_scores
+                .iter()
+                .find(|s| s.last_peer_id.as_deref() == Some(&c.peer_id))
+                .map(|s| s.successes as i64 - s.failures as i64)
+                .unwrap_or(0);
+            (c, rtt_score)
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Route::Unreachable;
+    }
+
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.peer_id.cmp(&b.0.peer_id)));
+
+    let via_str = &candidates[0].0.peer_id;
+    if let (Ok(via), Ok(dest)) = (via_str.parse::<libp2p::PeerId>(), target.parse::<libp2p::PeerId>()) {
+        Route::Relayed { via, destination: dest }
+    } else {
+        Route::Unreachable
+    }
+}
+
+pub(super) async fn send_frame_relayed_libp2p(
+    state: &Arc<RwLock<DaemonStatus>>,
+    swarm: &mut libp2p::Swarm<VoicersBehaviour>,
+    media: &MediaHandle,
+    via: libp2p::PeerId,
+    destination: libp2p::PeerId,
+) {
+    let destination_str = destination.to_string();
+    match media.build_next_audio_frame(destination_str.clone()).await {
+        Ok(frame) => {
+            swarm.behaviour_mut().media.send_request(
+                &via,
+                voicers_core::MediaRequest::RelayedFrame {
+                    destination: destination_str,
+                    frame,
+                },
+            );
+        }
+        Err(error) => {
+            push_note(
+                state,
+                format!("failed to build audio frame for {destination_str}: {error}"),
+            )
+            .await;
+        }
+    }
 }
 
 pub(super) async fn send_frame_libp2p(
@@ -471,6 +558,7 @@ mod tests {
             pinned: true,
             seen: true,
             whitelisted: false,
+            trusted_contact: false,
         });
         status
             .network
@@ -513,6 +601,7 @@ mod tests {
             pinned: true,
             seen: true,
             whitelisted: false,
+            trusted_contact: false,
         });
 
         let ranked = resolve_ranked_dial_target(

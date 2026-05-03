@@ -20,7 +20,7 @@ use serde_json;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use voicers_core::{
     encode_peer_compact_invite, encode_room_compact_invite, CompactInviteKind, CompactInviteV1,
-    DaemonStatus, KnownPeerSummary, MediaRequest, MediaResponse, MediaStreamState,
+    DaemonStatus, KnownPeerSummary, MediaAck, MediaRequest, MediaResponse, MediaStreamState,
     PathScoreSummary, PeerMediaState, PeerSessionState, PeerSummary, PeerTransportState,
     SessionHello, SessionRequest, SessionResponse, WebRtcSignal,
 };
@@ -28,7 +28,8 @@ use voicers_core::{
 use std::sync::Arc;
 
 use self::media_transport::{
-    address_path_name, resolve_ranked_dial_target, select_media_path, send_frame_libp2p,
+    address_path_name, resolve_ranked_dial_target, resolve_route, select_media_path,
+    send_frame_libp2p, send_frame_relayed_libp2p, Route,
 };
 #[cfg(feature = "webrtc-transport")]
 use self::media_transport::{
@@ -443,6 +444,7 @@ async fn run_network_task(
     let mut pending_rendezvous_publications = HashMap::new();
     let mut published_rendezvous_records = HashMap::new();
     let mut pending_inbound_approvals = HashMap::new();
+    let mut relay_offers: HashMap<String, Vec<String>> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -459,6 +461,7 @@ async fn run_network_task(
                     &mut pending_rendezvous_publications,
                     &mut published_rendezvous_records,
                     &mut pending_inbound_approvals,
+                    &relay_offers,
                     &media,
                     command,
                 ).await;
@@ -477,6 +480,7 @@ async fn run_network_task(
                     &mut pending_rendezvous_publications,
                     &mut published_rendezvous_records,
                     &mut pending_inbound_approvals,
+                    &mut relay_offers,
                     &media,
                     &persistence,
                     event,
@@ -508,6 +512,7 @@ async fn run_network_task(
     let mut pending_rendezvous_publications = HashMap::new();
     let mut published_rendezvous_records = HashMap::new();
     let mut pending_inbound_approvals = HashMap::new();
+    let mut relay_offers: HashMap<String, Vec<String>> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -524,6 +529,7 @@ async fn run_network_task(
                     &mut pending_rendezvous_publications,
                     &mut published_rendezvous_records,
                     &mut pending_inbound_approvals,
+                    &relay_offers,
                     &webrtc,
                     &media,
                     command,
@@ -558,6 +564,7 @@ async fn run_network_task(
                     &mut pending_rendezvous_publications,
                     &mut published_rendezvous_records,
                     &mut pending_inbound_approvals,
+                    &mut relay_offers,
                     &webrtc,
                     &media,
                     &persistence,
@@ -580,6 +587,7 @@ async fn handle_command(
     pending_rendezvous_publications: &mut HashMap<kad::QueryId, (String, Vec<u8>)>,
     published_rendezvous_records: &mut HashMap<String, Vec<u8>>,
     pending_inbound_approvals: &mut HashMap<String, PendingInboundApproval>,
+    relay_offers: &HashMap<String, Vec<String>>,
     #[cfg(feature = "webrtc-transport")] webrtc: &Option<WebRtcHandle>,
     media: &MediaHandle,
     command: NetworkCommand,
@@ -659,10 +667,47 @@ async fn handle_command(
         }
         NetworkCommand::SendMediaFrame { peer_id } => {
             if active_media_flows.contains(&peer_id) {
-                #[cfg(feature = "webrtc-transport")]
-                send_next_media_frame_webrtc_first(state, swarm, webrtc, media, &peer_id).await;
-                #[cfg(not(feature = "webrtc-transport"))]
-                send_next_media_frame(state, swarm, media, &peer_id).await;
+                let route = {
+                    let s = state.read().await;
+                    resolve_route(&s, relay_offers, &peer_id)
+                };
+                match route {
+                    Route::Direct(_) => {
+                        #[cfg(feature = "webrtc-transport")]
+                        send_next_media_frame_webrtc_first(state, swarm, webrtc, media, &peer_id).await;
+                        #[cfg(not(feature = "webrtc-transport"))]
+                        send_next_media_frame(state, swarm, media, &peer_id).await;
+                        {
+                            let mut s = state.write().await;
+                            if let Some(peer) = s.peers.iter_mut().find(|p| p.peer_id == peer_id) {
+                                peer.media.route_via = None;
+                            }
+                        }
+                    }
+                    Route::Relayed { via, destination } => {
+                        let self_peer_id = state.read().await.local_peer_id.clone();
+                        if destination.to_string() == self_peer_id {
+                            push_note(state, format!("self-loop guard: refusing relayed frame to self for {peer_id}")).await;
+                        } else {
+                            let via_str = via.to_string();
+                            send_frame_relayed_libp2p(state, swarm, media, via, destination).await;
+                            let mut s = state.write().await;
+                            if let Some(peer) = s.peers.iter_mut().find(|p| p.peer_id == peer_id) {
+                                peer.media.route_via = Some(via_str);
+                            }
+                        }
+                    }
+                    Route::Unreachable => {
+                        push_note(state, format!("no relay available for {peer_id}")).await;
+                        active_media_flows.remove(&peer_id);
+                        let mut s = state.write().await;
+                        if let Some(peer) = s.peers.iter_mut().find(|p| p.peer_id == peer_id) {
+                            peer.media.stream_state = MediaStreamState::Idle;
+                            peer.media.route_via = None;
+                        }
+                        return;
+                    }
+                }
                 schedule_media_tick(command_tx.clone(), peer_id);
             }
         }
@@ -796,6 +841,7 @@ async fn handle_swarm_event(
     pending_rendezvous_publications: &mut HashMap<kad::QueryId, (String, Vec<u8>)>,
     published_rendezvous_records: &mut HashMap<String, Vec<u8>>,
     pending_inbound_approvals: &mut HashMap<String, PendingInboundApproval>,
+    relay_offers: &mut HashMap<String, Vec<String>>,
     #[cfg(feature = "webrtc-transport")] webrtc: &Option<WebRtcHandle>,
     media: &MediaHandle,
     persistence: &PersistenceHandle,
@@ -903,6 +949,13 @@ async fn handle_swarm_event(
                 SessionHello {
                     room_name: state.session.room_name.clone(),
                     display_name: state.session.display_name.clone(),
+                    trusted_contacts: state
+                        .network
+                        .known_peers
+                        .iter()
+                        .filter(|p| p.trusted_contact)
+                        .map(|p| p.peer_id.clone())
+                        .collect(),
                 }
             };
             let should_surface_peer = {
@@ -999,6 +1052,9 @@ async fn handle_swarm_event(
                 insert_unique_note(&mut state, format!("connection closed with {peer_id}"));
             }
             active_media_flows.remove(&peer_id.to_string());
+            if num_established == 0 {
+                relay_offers.remove(&peer_id.to_string());
+            }
             let _ = media.disconnect_peer(peer_id.to_string()).await;
             persist_network_snapshot(state, persistence).await;
         }
@@ -1552,6 +1608,7 @@ async fn handle_swarm_event(
                     )
                     .await;
                 } else {
+                    relay_offers.insert(peer.to_string(), hello.trusted_contacts.clone());
                     apply_approved_session_hello(
                         state,
                         swarm,
@@ -1625,6 +1682,7 @@ async fn handle_swarm_event(
                 response: SessionResponse::HelloAck(hello),
                 ..
             } => {
+                relay_offers.insert(peer.to_string(), hello.trusted_contacts.clone());
                 apply_session_hello(state, peer.to_string(), hello).await;
                 persist_network_snapshot(state, persistence).await;
                 let _ = media.register_peer(peer.to_string()).await;
@@ -1713,6 +1771,76 @@ async fn handle_swarm_event(
                     }
                 }
             }
+            request_response::Message::Request {
+                request: MediaRequest::RelayedFrame { destination, frame },
+                channel,
+                ..
+            } => {
+                let local_peer_id = state.read().await.local_peer_id.clone();
+                if destination == local_peer_id {
+                    match media
+                        .handle_incoming_frame(peer.to_string(), frame.clone())
+                        .await
+                    {
+                        Ok(ack) => {
+                            let _ = swarm.behaviour_mut().media.send_response(
+                                channel,
+                                MediaResponse::RelayAck { destination, ack },
+                            );
+                        }
+                        Err(error) => {
+                            push_note(
+                                state,
+                                format!("media engine failed for relayed frame from {peer}: {error}"),
+                            )
+                            .await;
+                        }
+                    }
+                } else if let Ok(destination_peer_id) = destination.parse::<PeerId>() {
+                    let is_trusted = state
+                        .read()
+                        .await
+                        .network
+                        .known_peers
+                        .iter()
+                        .any(|kp| kp.peer_id == destination && kp.trusted_contact);
+                    if connected_peers.contains(&destination_peer_id) && is_trusted {
+                        // SECURITY: relay sees frames in cleartext; per-hop encryption deferred to future iteration.
+                        swarm.behaviour_mut().media.send_request(
+                            &destination_peer_id,
+                            MediaRequest::RelayedFrame {
+                                destination: destination.clone(),
+                                frame: frame.clone(),
+                            },
+                        );
+                        let ack = MediaAck {
+                            accepted_sequence: frame.sequence,
+                            queue_depth: 0,
+                            queued_samples: 0,
+                        };
+                        let _ = swarm.behaviour_mut().media.send_response(
+                            channel,
+                            MediaResponse::RelayAck { destination, ack },
+                        );
+                    } else {
+                        let _ = swarm.behaviour_mut().media.send_response(
+                            channel,
+                            MediaResponse::RelayDenied {
+                                destination,
+                                reason: "not relaying for that peer".to_string(),
+                            },
+                        );
+                    }
+                } else {
+                    let _ = swarm.behaviour_mut().media.send_response(
+                        channel,
+                        MediaResponse::RelayDenied {
+                            destination,
+                            reason: "not relaying for that peer".to_string(),
+                        },
+                    );
+                }
+            }
             request_response::Message::Response {
                 response: MediaResponse::Ack(ack),
                 ..
@@ -1724,6 +1852,28 @@ async fn handle_swarm_event(
                     )
                     .await;
                 }
+            }
+            request_response::Message::Response {
+                response: MediaResponse::RelayAck { ack, .. },
+                ..
+            } => {
+                if let Err(error) = media.handle_ack(peer.to_string(), ack).await {
+                    push_note(
+                        state,
+                        format!("media ack handling failed for {peer}: {error}"),
+                    )
+                    .await;
+                }
+            }
+            request_response::Message::Response {
+                response: MediaResponse::RelayDenied { destination, reason },
+                ..
+            } => {
+                push_note(
+                    state,
+                    format!("relay denied for {destination} via {peer}: {reason}"),
+                )
+                .await;
             }
         },
         SwarmEvent::Behaviour(VoicersBehaviourEvent::Media(
@@ -1845,6 +1995,7 @@ fn get_or_insert_peer<'a>(
             decoded_frames: 0,
             queued_samples: 0,
             last_sequence: None,
+            route_via: None,
         },
     });
 
@@ -1955,6 +2106,13 @@ async fn apply_approved_session_hello(
         SessionResponse::HelloAck(SessionHello {
             room_name: state.session.room_name.clone(),
             display_name: state.session.display_name.clone(),
+            trusted_contacts: state
+                .network
+                .known_peers
+                .iter()
+                .filter(|p| p.trusted_contact)
+                .map(|p| p.peer_id.clone())
+                .collect(),
         })
     };
     if let Err(response) = swarm.behaviour_mut().session.send_response(channel, response) {
@@ -2450,6 +2608,7 @@ fn update_known_peer(
             pinned: false,
             seen,
             whitelisted: false,
+            trusted_contact: false,
         });
         state
             .network
@@ -2721,6 +2880,7 @@ mod tests {
                 pinned: false,
                 seen: true,
                 whitelisted: false,
+                trusted_contact: false,
             }],
             Vec::new(),
         );

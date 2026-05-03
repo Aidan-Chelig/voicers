@@ -243,10 +243,7 @@ impl App {
                 } else {
                     clear_room_invite(&mut state, &normalized_room);
                 }
-                let hello = SessionHello {
-                    room_name: state.session.room_name.clone(),
-                    display_name: state.session.display_name.clone(),
-                };
+                let hello = build_local_hello(&state);
                 drop(state);
                 let _ = self.network.broadcast_session_hello(hello).await;
                 let _ = self.persist_state().await;
@@ -321,10 +318,7 @@ impl App {
                     let local_peer_id = state.local_peer_id.clone();
                     let display_name = state.session.display_name.clone();
                     sync_local_room_memberships(&mut state.rooms, &local_peer_id, &display_name);
-                    SessionHello {
-                        room_name: state.session.room_name.clone(),
-                        display_name: state.session.display_name.clone(),
-                    }
+                    build_local_hello(&state)
                 };
                 let _ = self.network.broadcast_session_hello(hello).await;
                 let _ = self.persist_state().await;
@@ -458,6 +452,7 @@ impl App {
                                 voicers_core::PeerSessionState::Active { .. }
                             ),
                             whitelisted: false,
+                            trusted_contact: false,
                         });
                     live_peer.display_name
                 } else {
@@ -616,15 +611,76 @@ impl App {
                     invite_code.clone(),
                     Some(expires_at_ms),
                 );
-                let hello = SessionHello {
-                    room_name: state.session.room_name.clone(),
-                    display_name: state.session.display_name.clone(),
-                };
+                let hello = build_local_hello(&state);
                 drop(state);
                 let _ = self.network.broadcast_session_hello(hello).await;
                 let _ = self.persist_state().await;
                 ControlResponse::Ack {
                     message: format!("room invite rotated to {invite_code}"),
+                }
+            }
+            ControlRequest::MarkTrustedContact { peer_id } => {
+                let hello = {
+                    let mut state = self.state.write().await;
+                    if let Some(peer) = state
+                        .network
+                        .known_peers
+                        .iter_mut()
+                        .find(|p| p.peer_id == peer_id)
+                    {
+                        peer.trusted_contact = true;
+                    } else {
+                        return ControlResponse::Error {
+                            message: "peer not found in known peers".to_string(),
+                        };
+                    }
+                    state.network.refresh_user_views();
+                    build_local_hello(&state)
+                };
+                let snapshot = {
+                    let state = self.state.read().await;
+                    (
+                        state.session.display_name.clone(),
+                        state.rooms.clone(),
+                        state.network.clone(),
+                    )
+                };
+                let _ = self.persist_network(snapshot.0, snapshot.1, snapshot.2);
+                let _ = self.network.broadcast_session_hello(hello).await;
+                ControlResponse::Ack {
+                    message: format!("{peer_id} marked as trusted contact"),
+                }
+            }
+            ControlRequest::UnmarkTrustedContact { peer_id } => {
+                let hello = {
+                    let mut state = self.state.write().await;
+                    if let Some(peer) = state
+                        .network
+                        .known_peers
+                        .iter_mut()
+                        .find(|p| p.peer_id == peer_id)
+                    {
+                        peer.trusted_contact = false;
+                    } else {
+                        return ControlResponse::Error {
+                            message: "peer not found in known peers".to_string(),
+                        };
+                    }
+                    state.network.refresh_user_views();
+                    build_local_hello(&state)
+                };
+                let snapshot = {
+                    let state = self.state.read().await;
+                    (
+                        state.session.display_name.clone(),
+                        state.rooms.clone(),
+                        state.network.clone(),
+                    )
+                };
+                let _ = self.persist_network(snapshot.0, snapshot.1, snapshot.2);
+                let _ = self.network.broadcast_session_hello(hello).await;
+                ControlResponse::Ack {
+                    message: format!("{peer_id} unmarked as trusted contact"),
                 }
             }
         }
@@ -685,6 +741,7 @@ impl App {
                     pinned: false,
                     seen: false,
                     whitelisted: false,
+                    trusted_contact: false,
                 });
                 state.network.known_peers.len() - 1
             });
@@ -734,6 +791,7 @@ impl App {
                 decoded_frames: 0,
                 queued_samples: 0,
                 last_sequence: None,
+                route_via: None,
             },
         });
     }
@@ -899,5 +957,20 @@ fn sync_local_room_memberships(rooms: &mut [RoomSummary], local_peer_id: &str, d
                 }
             }
         }
+    }
+}
+
+fn build_local_hello(state: &DaemonStatus) -> SessionHello {
+    let trusted_contacts = state
+        .network
+        .known_peers
+        .iter()
+        .filter(|p| p.trusted_contact)
+        .map(|p| p.peer_id.clone())
+        .collect();
+    SessionHello {
+        room_name: state.session.room_name.clone(),
+        display_name: state.session.display_name.clone(),
+        trusted_contacts,
     }
 }
