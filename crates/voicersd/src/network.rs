@@ -945,6 +945,10 @@ async fn handle_swarm_event(
             let peer_id_string = peer_id.to_string();
             let had_pending_dial = pending_dials.remove(&peer_id_string).is_some();
             let address = endpoint.get_remote_address().to_string();
+            let dial_address = match &endpoint {
+                libp2p::core::ConnectedPoint::Dialer { .. } => address.clone(),
+                libp2p::core::ConnectedPoint::Listener { .. } => String::new(),
+            };
             let local_hello = {
                 let state = state.read().await;
                 SessionHello {
@@ -992,7 +996,7 @@ async fn handle_swarm_event(
             )
             .await;
             if should_surface_peer {
-                let peer = upsert_peer(state, peer_id_string.clone(), address).await;
+                let peer = upsert_peer(state, peer_id_string.clone(), dial_address).await;
                 let _ = media.register_peer(peer.peer_id.clone()).await;
                 let should_send_hello = match &endpoint {
                     libp2p::core::ConnectedPoint::Dialer { .. } => true,

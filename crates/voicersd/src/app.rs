@@ -15,6 +15,7 @@ use voicers_core::{
 
 #[cfg(feature = "webrtc-transport")]
 use crate::webrtc_transport::{self, WebRtcTransportConfig};
+use crate::network::update_share_invite;
 use crate::{
     media,
     network::{self, NetworkHandle},
@@ -99,6 +100,7 @@ impl App {
             direct_call_invite: persisted.last_share_invite,
         };
         network.refresh_user_views();
+        let config_display_name = config.display_name.clone();
         let initial_display_name = persisted
             .local_display_name
             .clone()
@@ -167,6 +169,7 @@ impl App {
                 config.use_default_bootstrap_addrs,
                 &config.stun_servers,
                 config.enable_stun,
+                &config_display_name,
                 #[cfg(feature = "webrtc-transport")]
                 Some(webrtc),
                 #[cfg(feature = "webrtc-transport")]
@@ -222,6 +225,10 @@ impl App {
         self.state.read().await.clone()
     }
 
+    pub async fn peer_id(&self) -> String {
+        self.state.read().await.local_peer_id.clone()
+    }
+
     pub async fn handle_request(&self, request: ControlRequest) -> ControlResponse {
         match request {
             ControlRequest::GetStatus => ControlResponse::Status(self.status().await),
@@ -243,6 +250,7 @@ impl App {
                 } else {
                     clear_room_invite(&mut state, &normalized_room);
                 }
+                update_share_invite(&mut state);
                 let hello = build_local_hello(&state);
                 drop(state);
                 let _ = self.network.broadcast_session_hello(hello).await;
@@ -255,13 +263,18 @@ impl App {
                 let dial_target = match parse_join_target(&address) {
                     JoinTarget::Raw(target) => target,
                     JoinTarget::Invite(invite) => {
+                        let has_addrs = !invite.addrs.is_empty();
                         let code_target = match invite.kind {
                             CompactInviteKind::DirectCall => None,
-                            CompactInviteKind::Room => invite
+                            // If the invite carries addresses, dial the peer directly (the
+                            // addresses are seeded below). Fall back to DHT-based room/code
+                            // lookup only when no direct address is available.
+                            CompactInviteKind::Room if !has_addrs => invite
                                 .invite_code
                                 .clone()
                                 .filter(|_| invite.expires_at_ms.unwrap_or(u64::MAX) > now_ms())
                                 .or_else(|| invite.room_name.clone()),
+                            CompactInviteKind::Room => None,
                         };
                         let peer_id = invite.peer_id.clone();
                         self.seed_invite_hints(invite).await;
@@ -611,6 +624,7 @@ impl App {
                     invite_code.clone(),
                     Some(expires_at_ms),
                 );
+                update_share_invite(&mut state);
                 let hello = build_local_hello(&state);
                 drop(state);
                 let _ = self.network.broadcast_session_hello(hello).await;

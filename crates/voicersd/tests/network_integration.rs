@@ -655,3 +655,269 @@ async fn persisted_known_peer_survives_daemon_restart() -> Result<()> {
 
     Ok(())
 }
+
+// ── Room join approval gate ──────────────────────────────────────────────────
+
+// An unknown peer joining via room invite must appear in pending_peer_approvals
+// on the host — the host must explicitly approve before the guest is connected.
+#[tokio::test]
+async fn room_join_unknown_guest_requires_approval() -> Result<()> {
+    let host = NetworkHarness::spawn("host").await?;
+    let guest = NetworkHarness::spawn("guest").await?;
+
+    common::expect_ack(
+        host.request(ControlRequest::CreateRoom {
+            room_name: "lobby".into(),
+        })
+        .await?,
+    )?;
+
+    let host_listen_addr = host.listen_addr().await?;
+    let host_status = host.status().await?;
+    let invite = host_status
+        .rooms
+        .iter()
+        .find(|r| r.name == "lobby")
+        .and_then(|r| r.current_invite.as_ref())
+        .ok_or_else(|| anyhow!("no invite on lobby"))?;
+    let invite_url = encode_room_compact_invite(
+        &host.peer_id,
+        "lobby",
+        &[host_listen_addr],
+        &invite.invite_code,
+        invite.expires_at_ms,
+    );
+
+    guest
+        .request(ControlRequest::JoinPeer {
+            address: invite_url,
+        })
+        .await?;
+
+    // Host must gate the unknown guest.
+    host.wait_for_pending(&guest.peer_id, Duration::from_secs(5))
+        .await
+        .map_err(|_| anyhow!("guest never appeared in host's pending_peer_approvals — approval gate bypassed"))?;
+
+    // Guest must NOT be connected yet.
+    let guest_status = guest.status().await?;
+    assert!(
+        !guest_status.peers.iter().any(|p| p.peer_id == host.peer_id
+            && matches!(p.transport, PeerTransportState::Connected)),
+        "guest should not be Connected before host approves"
+    );
+
+    Ok(())
+}
+
+// After the host approves, the guest reaches Connected and can see the host.
+#[tokio::test]
+async fn room_join_approved_guest_reaches_connected() -> Result<()> {
+    let host = NetworkHarness::spawn("host").await?;
+    let guest = NetworkHarness::spawn("guest").await?;
+
+    common::expect_ack(
+        host.request(ControlRequest::CreateRoom {
+            room_name: "lobby".into(),
+        })
+        .await?,
+    )?;
+
+    let host_listen_addr = host.listen_addr().await?;
+    let host_status = host.status().await?;
+    let invite = host_status
+        .rooms
+        .iter()
+        .find(|r| r.name == "lobby")
+        .and_then(|r| r.current_invite.as_ref())
+        .ok_or_else(|| anyhow!("no invite on lobby"))?;
+    let invite_url = encode_room_compact_invite(
+        &host.peer_id,
+        "lobby",
+        &[host_listen_addr],
+        &invite.invite_code,
+        invite.expires_at_ms,
+    );
+
+    guest
+        .request(ControlRequest::JoinPeer {
+            address: invite_url,
+        })
+        .await?;
+
+    host.wait_for_pending(&guest.peer_id, Duration::from_secs(5))
+        .await?;
+
+    common::expect_ack(
+        host.request(ControlRequest::ApprovePendingPeer {
+            peer_id: guest.peer_id.clone(),
+            whitelist: false,
+        })
+        .await?,
+    )?;
+
+    // Guest reaches Connected to host.
+    guest
+        .wait_for_peer(&host.peer_id, Duration::from_secs(5))
+        .await
+        .map_err(|_| anyhow!("guest did not reach Connected after host approved"))?;
+
+    // Host has no more pending approvals.
+    let host_status = host.status().await?;
+    assert!(
+        !host_status
+            .pending_peer_approvals
+            .iter()
+            .any(|p| p.peer_id == guest.peer_id),
+        "guest should no longer be in host's pending_peer_approvals after approval"
+    );
+
+    // Host sees guest as Connected.
+    assert!(
+        host_status.peers.iter().any(|p| p.peer_id == guest.peer_id
+            && matches!(p.transport, PeerTransportState::Connected)),
+        "host should see guest as Connected after approval"
+    );
+
+    Ok(())
+}
+
+// Rejecting a room-join guest removes them from pending and leaves them disconnected.
+#[tokio::test]
+async fn room_join_rejected_guest_not_connected() -> Result<()> {
+    let host = NetworkHarness::spawn("host").await?;
+    let guest = NetworkHarness::spawn("guest").await?;
+
+    common::expect_ack(
+        host.request(ControlRequest::CreateRoom {
+            room_name: "lobby".into(),
+        })
+        .await?,
+    )?;
+
+    let host_listen_addr = host.listen_addr().await?;
+    let host_status = host.status().await?;
+    let invite = host_status
+        .rooms
+        .iter()
+        .find(|r| r.name == "lobby")
+        .and_then(|r| r.current_invite.as_ref())
+        .ok_or_else(|| anyhow!("no invite on lobby"))?;
+    let invite_url = encode_room_compact_invite(
+        &host.peer_id,
+        "lobby",
+        &[host_listen_addr],
+        &invite.invite_code,
+        invite.expires_at_ms,
+    );
+
+    guest
+        .request(ControlRequest::JoinPeer {
+            address: invite_url,
+        })
+        .await?;
+
+    host.wait_for_pending(&guest.peer_id, Duration::from_secs(5))
+        .await?;
+
+    common::expect_ack(
+        host.request(ControlRequest::RejectPendingPeer {
+            peer_id: guest.peer_id.clone(),
+        })
+        .await?,
+    )?;
+
+    // Give the rejection a moment to propagate, then verify guest is not Connected.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let guest_status = guest.status().await?;
+    assert!(
+        !guest_status.peers.iter().any(|p| p.peer_id == host.peer_id
+            && matches!(p.transport, PeerTransportState::Connected)),
+        "rejected guest should not be Connected"
+    );
+
+    let host_status = host.status().await?;
+    assert!(
+        !host_status
+            .pending_peer_approvals
+            .iter()
+            .any(|p| p.peer_id == guest.peer_id),
+        "rejected guest should be removed from pending_peer_approvals"
+    );
+
+    Ok(())
+}
+
+// A whitelisted peer joining via room invite bypasses the approval gate entirely.
+// We whitelist the guest via a first connection (approve with whitelist:true), then
+// the guest reconnects via a room invite and should be auto-approved.
+#[tokio::test]
+async fn room_join_whitelisted_guest_auto_approved() -> Result<()> {
+    let host = NetworkHarness::spawn("host").await?;
+    let guest = NetworkHarness::spawn("guest").await?;
+
+    // First: connect guest directly so host can whitelist them.
+    let host_listen_addr = host.listen_addr().await?;
+    guest
+        .request(ControlRequest::JoinPeer {
+            address: host_listen_addr.clone(),
+        })
+        .await?;
+    host.wait_for_pending(&guest.peer_id, Duration::from_secs(5))
+        .await?;
+    common::expect_ack(
+        host.request(ControlRequest::ApprovePendingPeer {
+            peer_id: guest.peer_id.clone(),
+            whitelist: true,
+        })
+        .await?,
+    )?;
+    guest
+        .wait_for_peer(&host.peer_id, Duration::from_secs(5))
+        .await?;
+
+    // Guest is now whitelisted. Host creates a room.
+    common::expect_ack(
+        host.request(ControlRequest::CreateRoom {
+            room_name: "lobby".into(),
+        })
+        .await?,
+    )?;
+
+    let host_listen_addr = host.listen_addr().await?;
+    let host_status = host.status().await?;
+    let invite = host_status
+        .rooms
+        .iter()
+        .find(|r| r.name == "lobby")
+        .and_then(|r| r.current_invite.as_ref())
+        .ok_or_else(|| anyhow!("no invite on lobby"))?;
+    let invite_url = encode_room_compact_invite(
+        &host.peer_id,
+        "lobby",
+        &[host_listen_addr],
+        &invite.invite_code,
+        invite.expires_at_ms,
+    );
+
+    guest
+        .request(ControlRequest::JoinPeer {
+            address: invite_url,
+        })
+        .await?;
+
+    // Whitelisted guest should reach Connected without any manual approval.
+    guest
+        .wait_for_peer(&host.peer_id, Duration::from_secs(5))
+        .await
+        .map_err(|_| anyhow!("whitelisted guest did not auto-connect"))?;
+
+    let host_status = host.status().await?;
+    assert!(
+        host_status.pending_peer_approvals.is_empty(),
+        "whitelisted guest should not appear in pending_peer_approvals"
+    );
+
+    Ok(())
+}

@@ -57,7 +57,7 @@ enum WebRtcPathState {
 }
 
 pub(super) enum Route {
-    Direct(libp2p::PeerId),
+    Direct,
     Relayed { via: libp2p::PeerId, destination: libp2p::PeerId },
     Unreachable,
 }
@@ -70,10 +70,8 @@ pub(super) fn resolve_route(
     let known = state.network.known_peers.iter().find(|p| p.peer_id == target);
 
     if let Some(peer) = known {
-        if peer.trusted_contact && peer.connected {
-            if let Ok(pid) = target.parse() {
-                return Route::Direct(pid);
-            }
+        if peer.trusted_contact && peer.connected && target.parse::<libp2p::PeerId>().is_ok() {
+            return Route::Direct;
         }
     }
 
@@ -330,6 +328,12 @@ pub(super) fn resolve_ranked_dial_target(
                     fallbacks: ranked.into_iter().skip(1).collect(),
                 };
             }
+            // Peer not yet known — still track peer_id so the connection is surfaced.
+            return RankedDialTarget {
+                peer_id: Some(peer_id.clone()),
+                primary: requested.to_string(),
+                fallbacks: Vec::new(),
+            };
         }
     }
 
@@ -614,6 +618,154 @@ mod tests {
             format!("/ip4/203.0.113.30/tcp/4001/p2p/{peer_id}")
         );
         assert_eq!(ranked.fallbacks.len(), 1);
+    }
+
+    fn make_route_status(peers: Vec<KnownPeerSummary>) -> DaemonStatus {
+        let mut status = daemon_status_for_ranking();
+        status.network.known_peers = peers;
+        status
+    }
+
+    const TARGET: &str = "QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN";
+    const BOB: &str = "QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa";
+    const CAROL: &str = "QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb";
+
+    fn peer(id: &str, trusted: bool, connected: bool) -> KnownPeerSummary {
+        KnownPeerSummary {
+            peer_id: id.to_string(),
+            display_name: id[..8].to_string(),
+            addresses: vec![],
+            last_dial_addr: None,
+            connected,
+            pinned: false,
+            seen: true,
+            whitelisted: false,
+            trusted_contact: trusted,
+        }
+    }
+
+    #[test]
+    fn resolve_route_direct_when_trusted_and_connected() {
+        let status = make_route_status(vec![peer(TARGET, true, true)]);
+        let offers = HashMap::new();
+        let route = resolve_route(&status, &offers, TARGET);
+        assert!(matches!(route, Route::Direct));
+    }
+
+    #[test]
+    fn resolve_route_unreachable_when_not_trusted() {
+        let status = make_route_status(vec![peer(TARGET, false, true)]);
+        let offers = HashMap::new();
+        assert!(matches!(resolve_route(&status, &offers, TARGET), Route::Unreachable));
+    }
+
+    #[test]
+    fn resolve_route_unreachable_when_trusted_but_disconnected() {
+        let status = make_route_status(vec![peer(TARGET, true, false)]);
+        let offers = HashMap::new();
+        assert!(matches!(resolve_route(&status, &offers, TARGET), Route::Unreachable));
+    }
+
+    #[test]
+    fn resolve_route_relay_when_not_directly_reachable() {
+        let status = make_route_status(vec![peer(TARGET, false, false), peer(BOB, true, true)]);
+        let mut offers = HashMap::new();
+        offers.insert(BOB.to_string(), vec![TARGET.to_string()]);
+        let route = resolve_route(&status, &offers, TARGET);
+        let expected_via: libp2p::PeerId = BOB.parse().unwrap();
+        let expected_dest: libp2p::PeerId = TARGET.parse().unwrap();
+        assert!(
+            matches!(route, Route::Relayed { via, destination } if via == expected_via && destination == expected_dest)
+        );
+    }
+
+    #[test]
+    fn resolve_route_unreachable_when_relay_not_connected() {
+        let status = make_route_status(vec![peer(TARGET, false, false), peer(BOB, true, false)]);
+        let mut offers = HashMap::new();
+        offers.insert(BOB.to_string(), vec![TARGET.to_string()]);
+        assert!(matches!(resolve_route(&status, &offers, TARGET), Route::Unreachable));
+    }
+
+    #[test]
+    fn resolve_route_relay_picks_best_path_score() {
+        let mut status = make_route_status(vec![
+            peer(TARGET, false, false),
+            peer(BOB, true, true),
+            peer(CAROL, true, true),
+        ]);
+        status.network.path_scores.push(voicers_core::PathScoreSummary {
+            path: LIBP2P_RELAY_PATH.to_string(),
+            successes: 5,
+            failures: 0,
+            last_peer_id: Some(BOB.to_string()),
+        });
+        status.network.path_scores.push(voicers_core::PathScoreSummary {
+            path: LIBP2P_RELAY_PATH.to_string(),
+            successes: 1,
+            failures: 0,
+            last_peer_id: Some(CAROL.to_string()),
+        });
+        let mut offers = HashMap::new();
+        offers.insert(BOB.to_string(), vec![TARGET.to_string()]);
+        offers.insert(CAROL.to_string(), vec![TARGET.to_string()]);
+        let route = resolve_route(&status, &offers, TARGET);
+        let expected_via: libp2p::PeerId = BOB.parse().unwrap();
+        assert!(matches!(route, Route::Relayed { via, .. } if via == expected_via));
+    }
+
+    #[test]
+    fn resolve_route_relay_when_target_not_in_known_peers() {
+        let status = make_route_status(vec![peer(BOB, true, true)]);
+        let mut offers = HashMap::new();
+        offers.insert(BOB.to_string(), vec![TARGET.to_string()]);
+        let route = resolve_route(&status, &offers, TARGET);
+        let expected_via: libp2p::PeerId = BOB.parse().unwrap();
+        assert!(matches!(route, Route::Relayed { via, .. } if via == expected_via));
+    }
+
+    #[test]
+    fn resolve_route_unreachable_when_relay_offers_wrong_target() {
+        let status = make_route_status(vec![peer(TARGET, false, false), peer(BOB, true, true)]);
+        let mut offers = HashMap::new();
+        offers.insert(BOB.to_string(), vec![CAROL.to_string()]);
+        assert!(matches!(resolve_route(&status, &offers, TARGET), Route::Unreachable));
+    }
+
+    #[test]
+    fn resolve_route_unreachable_when_trusted_relay_has_empty_offers() {
+        let status = make_route_status(vec![peer(TARGET, false, false), peer(BOB, true, true)]);
+        let mut offers = HashMap::new();
+        offers.insert(BOB.to_string(), vec![]);
+        assert!(matches!(resolve_route(&status, &offers, TARGET), Route::Unreachable));
+    }
+
+    #[test]
+    fn address_path_name_classifies_direct_tcp_address() {
+        let addr = format!("/ip4/198.51.100.10/tcp/4001/p2p/{TARGET}");
+        assert_eq!(address_path_name(&addr), LIBP2P_DIRECT_PATH);
+    }
+
+    #[test]
+    fn address_path_name_classifies_circuit_relay_address() {
+        let addr = format!("/ip4/203.0.113.20/tcp/4001/p2p/{BOB}/p2p-circuit/p2p/{TARGET}");
+        assert_eq!(address_path_name(&addr), LIBP2P_RELAY_PATH);
+    }
+
+    #[test]
+    fn resolve_route_relay_tiebreaks_by_peer_id() {
+        let status = make_route_status(vec![
+            peer(TARGET, false, false),
+            peer(BOB, true, true),
+            peer(CAROL, true, true),
+        ]);
+        let mut offers = HashMap::new();
+        offers.insert(BOB.to_string(), vec![TARGET.to_string()]);
+        offers.insert(CAROL.to_string(), vec![TARGET.to_string()]);
+        let route = resolve_route(&status, &offers, TARGET);
+        // BOB ("QmQ...") < CAROL ("Qmb...") lexicographically (uppercase 'Q' < lowercase 'b')
+        let expected_via: libp2p::PeerId = BOB.parse().unwrap();
+        assert!(matches!(route, Route::Relayed { via, .. } if via == expected_via));
     }
 
     fn daemon_status_for_ranking() -> DaemonStatus {
