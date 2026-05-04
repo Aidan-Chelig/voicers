@@ -271,6 +271,7 @@ pub async fn start(
     use_default_bootstrap_addrs: bool,
     stun_servers: &[String],
     enable_stun: bool,
+    display_name: &str,
     #[cfg(feature = "webrtc-transport")] webrtc: Option<WebRtcHandle>,
     #[cfg(feature = "webrtc-transport")] webrtc_signals: mpsc::Receiver<OutgoingWebRtcSignal>,
     #[cfg(feature = "webrtc-transport")] webrtc_media_frames: mpsc::Receiver<
@@ -318,7 +319,7 @@ pub async fn start(
                 kad: kad::Behaviour::new(local_peer_id, store),
                 identify: identify::Behaviour::new(
                     identify::Config::new(PROTOCOL_VERSION.to_string(), key.public())
-                        .with_agent_version("voicersd".to_string()),
+                        .with_agent_version(display_name.to_string()),
                 ),
                 ping: ping::Behaviour::new(
                     ping::Config::new().with_interval(Duration::from_secs(5)),
@@ -672,7 +673,7 @@ async fn handle_command(
                     resolve_route(&s, relay_offers, &peer_id)
                 };
                 match route {
-                    Route::Direct(_) => {
+                    Route::Direct => {
                         #[cfg(feature = "webrtc-transport")]
                         send_next_media_frame_webrtc_first(state, swarm, webrtc, media, &peer_id).await;
                         #[cfg(not(feature = "webrtc-transport"))]
@@ -1187,7 +1188,10 @@ async fn handle_swarm_event(
 
             {
                 let mut state = state.write().await;
-                if should_surface_peer_metadata(&state, &peer_id.to_string()) {
+                // Only surface identify info for peers that are already approved
+                // (in state.peers or known_peers). Pending-approval peers must not
+                // be promoted to Connected here — that would bypass the approval gate.
+                if should_surface_approved_peer(&state, &peer_id.to_string()) {
                     let identified_peer = {
                         let peer =
                             get_or_insert_peer(&mut state, peer_id.to_string(), remote_addr);
@@ -1598,29 +1602,34 @@ async fn handle_swarm_event(
                 channel,
                 ..
             } => {
-                if should_gate_peer_approval(state, &peer.to_string()).await {
-                    queue_pending_peer_approval(
-                        state,
-                        pending_inbound_approvals,
-                        &peer.to_string(),
-                        hello,
-                        channel,
-                    )
-                    .await;
-                } else {
-                    relay_offers.insert(peer.to_string(), hello.trusted_contacts.clone());
+                let peer_str = peer.to_string();
+                let already_connected = {
+                    let s = state.read().await;
+                    s.peers.iter().any(|p| p.peer_id == peer_str && matches!(p.transport, PeerTransportState::Connected))
+                };
+                if already_connected || !should_gate_peer_approval(state, &peer_str).await {
+                    relay_offers.insert(peer_str.clone(), hello.trusted_contacts.clone());
                     apply_approved_session_hello(
                         state,
                         swarm,
                         command_tx,
                         active_media_flows,
                         media,
-                        &peer.to_string(),
+                        &peer_str,
                         hello.clone(),
                         channel,
                     )
                     .await;
                     persist_network_snapshot(state, persistence).await;
+                } else {
+                    queue_pending_peer_approval(
+                        state,
+                        pending_inbound_approvals,
+                        &peer_str,
+                        hello,
+                        channel,
+                    )
+                    .await;
                 }
             }
             request_response::Message::Request {
@@ -2245,6 +2254,17 @@ fn should_surface_peer_metadata(state: &DaemonStatus, peer_id: &str) -> bool {
             .any(|pending| pending.peer_id == peer_id)
 }
 
+// Like should_surface_peer_metadata but excludes pending approvals — used by the
+// identify handler so that unapproved inbound peers can't bypass the approval gate.
+fn should_surface_approved_peer(state: &DaemonStatus, peer_id: &str) -> bool {
+    state.peers.iter().any(|peer| peer.peer_id == peer_id)
+        || state
+            .network
+            .known_peers
+            .iter()
+            .any(|peer| peer.peer_id == peer_id)
+}
+
 async fn record_webrtc_signal(
     state: &Arc<RwLock<DaemonStatus>>,
     peer_id: &PeerId,
@@ -2542,7 +2562,7 @@ fn remove_addr(addresses: &mut Vec<String>, address: &str) {
     addresses.retain(|candidate| candidate != address);
 }
 
-fn update_share_invite(state: &mut DaemonStatus) {
+pub(crate) fn update_share_invite(state: &mut DaemonStatus) {
     state.network.direct_call_invite = best_direct_call_invite(state).or_else(|| {
         state
             .network
