@@ -177,6 +177,8 @@ pub struct KnownPeerSummary {
     pub seen: bool,
     #[serde(default)]
     pub whitelisted: bool,
+    #[serde(default)]
+    pub trusted_contact: bool,
 }
 
 impl NetworkSummary {
@@ -340,11 +342,14 @@ pub struct MediaAck {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MediaRequest {
     Frame(MediaFrame),
+    RelayedFrame { destination: String, frame: MediaFrame },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MediaResponse {
     Ack(MediaAck),
+    RelayAck { destination: String, ack: MediaAck },
+    RelayDenied { destination: String, reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,12 +374,16 @@ pub struct PeerMediaState {
     pub decoded_frames: usize,
     pub queued_samples: usize,
     pub last_sequence: Option<u64>,
+    #[serde(default)]
+    pub route_via: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionHello {
     pub room_name: Option<String>,
     pub display_name: String,
+    #[serde(default)]
+    pub trusted_contacts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,6 +479,12 @@ pub enum ControlRequest {
         peer_id: String,
     },
     RotateInviteCode,
+    MarkTrustedContact {
+        peer_id: String,
+    },
+    UnmarkTrustedContact {
+        peer_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

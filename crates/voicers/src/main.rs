@@ -622,11 +622,6 @@ async fn handle_known_peers_screen(app: &mut UiApp, key: KeyCode) -> Result<bool
             app.clamp_seen_user_selection();
             app.set_flash(default_flash(Screen::SeenUsers));
         }
-        KeyCode::Char('t') => {
-            app.screen = Screen::DiscoveredPeers;
-            app.clamp_discovered_peer_selection();
-            app.set_flash(default_flash(Screen::DiscoveredPeers));
-        }
         KeyCode::Char('u') => {
             app.rename_input = app
                 .status
@@ -665,6 +660,9 @@ async fn handle_known_peers_screen(app: &mut UiApp, key: KeyCode) -> Result<bool
         }
         KeyCode::Char('D') => {
             forget_selected_known_peer(app).await;
+        }
+        KeyCode::Char('t') => {
+            toggle_trusted_contact(app).await;
         }
         KeyCode::Char('r') => {
             if let Some(peer) = app.selected_known_peer() {
@@ -1222,6 +1220,27 @@ async fn forget_selected_known_peer(app: &mut UiApp) {
         ControlRequest::ForgetKnownPeer { peer_id },
     )
     .await;
+    app.set_flash(render_message(response));
+    refresh_status(app).await;
+}
+
+async fn toggle_trusted_contact(app: &mut UiApp) {
+    let Some(peer) = app.selected_known_peer().cloned() else {
+        app.set_flash("no friend selected");
+        return;
+    };
+
+    let request = if peer.trusted_contact {
+        ControlRequest::UnmarkTrustedContact {
+            peer_id: peer.peer_id.clone(),
+        }
+    } else {
+        ControlRequest::MarkTrustedContact {
+            peer_id: peer.peer_id.clone(),
+        }
+    };
+
+    let response = client::send_request_to(&app.control_addr, request).await;
     app.set_flash(render_message(response));
     refresh_status(app).await;
 }
@@ -1894,7 +1913,7 @@ fn draw_main_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
 fn draw_main_details(frame: &mut Frame, app: &UiApp, area: Rect) {
     let lines = if let Some(status) = &app.status {
         let items = main_activity_items(status, &app.expanded_main_rooms, app.expanded_main_calls);
-        match items.get(app.selected_main_item) {
+        let lines = match items.get(app.selected_main_item) {
             Some(MainActivityItem::RoomGroup {
                 room_name,
                 engaged_users,
@@ -1985,7 +2004,8 @@ fn draw_main_details(frame: &mut Frame, app: &UiApp, area: Rect) {
                 "Select a room or call group",
                 Style::default().fg(color_muted()),
             ))],
-        }
+        };
+        lines
     } else {
         vec![Line::from(Span::styled(
             "Daemon unavailable",
@@ -1995,6 +2015,7 @@ fn draw_main_details(frame: &mut Frame, app: &UiApp, area: Rect) {
 
     let widget = Paragraph::new(lines)
         .block(panel_block("Details", color_panel_alt()))
+
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, area);
 }
@@ -2287,6 +2308,16 @@ fn draw_live_peers_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
             visible_peers
                 .into_iter()
                 .map(|peer| {
+                    let relay_label = peer.media.route_via.as_deref().map(|via_id| {
+                        let name = status
+                            .network
+                            .known_peers
+                            .iter()
+                            .find(|k| k.peer_id == via_id)
+                            .map(|k| k.display_name.clone())
+                            .unwrap_or_else(|| format!("@{}", &via_id[..via_id.len().min(8)]));
+                        format!("via @{name}")
+                    });
                     ListItem::new(vec![
                         Line::from(vec![
                             Span::styled(
@@ -2311,6 +2342,7 @@ fn draw_live_peers_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
                                 },
                                 color_bg(),
                             ),
+                            Span::raw(relay_label.map(|l| format!("  {l}")).unwrap_or_default()),
                         ]),
                         Line::from(vec![
                             Span::styled(
@@ -2434,7 +2466,7 @@ fn draw_rooms_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
 
 fn draw_room_details(frame: &mut Frame, app: &UiApp, area: Rect) {
     let lines = if let Some(status) = &app.status {
-        if let Some(room) = known_rooms(status).get(app.selected_room) {
+        let mut lines = if let Some(room) = known_rooms(status).get(app.selected_room) {
             vec![
                 Line::from(vec![
                     Span::styled(
@@ -2476,7 +2508,36 @@ fn draw_room_details(frame: &mut Frame, app: &UiApp, area: Rect) {
                 "Select a room to inspect or engage it",
                 Style::default().fg(color_muted()),
             ))]
+        };
+        if let Some(pending) = status.pending_peer_approvals.first() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Pending Approval",
+                    Style::default().fg(color_text()).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                badge("waiting", color_warn(), color_bg()),
+            ]));
+            lines.push(Line::from(format!(
+                "{} @{}",
+                pending.display_name,
+                short_id(&pending.peer_id)
+            )));
+            lines.push(Line::from(Span::styled(
+                pending.address.clone(),
+                Style::default().fg(color_subtle()),
+            )));
+            if let Some(room_name) = &pending.room_name {
+                lines.push(Line::from(vec![
+                    label("ROOM"),
+                    Span::raw(" "),
+                    Span::styled(room_name.clone(), Style::default().fg(color_text())),
+                ]));
+            }
+            lines.push(Line::from("Press y to allow once, w to allow+whitelist, n to reject."));
         }
+        lines
     } else {
         vec![Line::from(Span::styled(
             "Daemon unavailable",
@@ -2509,6 +2570,16 @@ fn draw_calls_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
                         voicers_core::PeerSessionState::Handshaking => "handshaking".to_string(),
                         voicers_core::PeerSessionState::None => "transport".to_string(),
                     };
+                    let relay_label = peer.media.route_via.as_deref().map(|via_id| {
+                        let name = status
+                            .network
+                            .known_peers
+                            .iter()
+                            .find(|k| k.peer_id == via_id)
+                            .map(|k| k.display_name.clone())
+                            .unwrap_or_else(|| format!("@{}", &via_id[..via_id.len().min(8)]));
+                        format!("via @{name}")
+                    });
                     ListItem::new(vec![
                         Line::from(vec![
                             Span::styled(
@@ -2523,6 +2594,7 @@ fn draw_calls_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
                                 transport_color(&peer.transport),
                                 color_bg(),
                             ),
+                            Span::raw(relay_label.map(|l| format!("  {l}")).unwrap_or_default()),
                         ]),
                         Line::from(vec![
                             Span::styled(
@@ -2791,6 +2863,11 @@ fn draw_known_peers_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
                                     .fg(color_text())
                                     .add_modifier(Modifier::BOLD),
                             ),
+                            if peer.trusted_contact {
+                                Span::styled(" [T]", Style::default().fg(color_accent()))
+                            } else {
+                                Span::raw("")
+                            },
                             Span::raw(" "),
                             if peer.pinned {
                                 badge("saved", color_accent(), color_bg())
@@ -3585,10 +3662,11 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("J", "Open the join dialog and paste an invite code."),
             ("j / k or arrows", "Move the selection."),
             ("Enter / d", "Reconnect to the selected friend."),
-            ("e", "Rename the selected friend."),
+            ("r", "Rename the selected friend."),
+            ("t", "Toggle trusted relay — marks this friend as a relay hop for strangers. Shows [T] when active."),
             ("D", "Remove the selected friend from Friends."),
             ("o / Esc", "Return to Main."),
-            ("p / r / l / v / t / c", "Jump to Engaged Users, Rooms, Calls, Seen Users, Network Peers, or Configuration."),
+            ("p / v / c", "Jump to Engaged Users, Seen Users, or Configuration."),
             ("g", "Refresh status immediately."),
         ],
         Screen::SeenUsers => &[
