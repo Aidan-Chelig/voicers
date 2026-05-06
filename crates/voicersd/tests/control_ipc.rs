@@ -537,11 +537,8 @@ async fn joining_room_invite_adopts_invited_room_before_dial() -> Result<()> {
         None,
     );
 
-    let response = common::send_request(
-        &daemon.app,
-        ControlRequest::JoinPeer { address: invite },
-    )
-    .await?;
+    let response =
+        common::send_request(&daemon.app, ControlRequest::JoinPeer { address: invite }).await?;
 
     assert!(
         matches!(response, ControlResponse::Error { .. }),
@@ -551,7 +548,10 @@ async fn joining_room_invite_adopts_invited_room_before_dial() -> Result<()> {
     let status = daemon.status().await?;
     assert_eq!(status.session.room_name.as_deref(), Some("local-demo"));
     assert!(
-        status.rooms.iter().any(|room| room.name == "local-demo" && room.engaged),
+        status
+            .rooms
+            .iter()
+            .any(|room| room.name == "local-demo" && room.engaged),
         "expected local-demo to be created and engaged after accepting room invite",
     );
 

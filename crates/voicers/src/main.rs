@@ -11,7 +11,9 @@ use std::{
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    },
     execute,
 };
 use ratatui::{
@@ -71,7 +73,7 @@ async fn run_tui(mut terminal: DefaultTerminal, config: UiConfig) -> Result<()> 
 
                     match app.input_mode {
                         InputMode::Normal => {
-                            if handle_key(&mut app, key.code).await? {
+                            if handle_key(&mut app, key).await? {
                                 break;
                             }
                         }
@@ -103,18 +105,115 @@ async fn run_tui(mut terminal: DefaultTerminal, config: UiConfig) -> Result<()> 
     Ok(())
 }
 
-async fn handle_key(app: &mut UiApp, key: KeyCode) -> Result<bool> {
-    match app.screen {
-        Screen::Main => handle_main_screen(app, key).await,
-        Screen::Peers => handle_peers_screen(app, key).await,
-        Screen::Rooms => handle_rooms_screen(app, key).await,
-        Screen::Calls => handle_calls_screen(app, key).await,
-        Screen::Config => handle_config_screen(app, key).await,
-        Screen::KnownPeers => handle_known_peers_screen(app, key).await,
-        Screen::SeenUsers => handle_seen_users_screen(app, key).await,
-        Screen::DiscoveredPeers => handle_discovered_peers_screen(app, key).await,
-        Screen::Help => handle_help_screen(app, key).await,
+async fn handle_key(app: &mut UiApp, key: KeyEvent) -> Result<bool> {
+    if let Some(screen) = global_screen_hotkey(key.code) {
+        navigate_to_screen(app, screen);
+        return Ok(false);
     }
+
+    match key.code {
+        KeyCode::Tab => {
+            cycle_tab(app, true);
+            return Ok(false);
+        }
+        KeyCode::BackTab => {
+            cycle_tab(app, false);
+            return Ok(false);
+        }
+        _ => {}
+    }
+
+    match app.screen {
+        Screen::Main => handle_main_screen(app, key.code).await,
+        Screen::Peers => handle_peers_screen(app, key.code).await,
+        Screen::Rooms => handle_rooms_screen(app, key.code).await,
+        Screen::Calls => handle_calls_screen(app, key.code).await,
+        Screen::Config => handle_config_screen(app, key.code).await,
+        Screen::KnownPeers => handle_known_peers_screen(app, key.code).await,
+        Screen::SeenUsers => handle_seen_users_screen(app, key.code).await,
+        Screen::DiscoveredPeers => handle_discovered_peers_screen(app, key.code).await,
+        Screen::Help => handle_help_screen(app, key.code).await,
+    }
+}
+
+fn global_screen_hotkey(key: KeyCode) -> Option<Screen> {
+    match key {
+        KeyCode::Char('M') => Some(Screen::Main),
+        KeyCode::Char('O') => Some(Screen::Rooms),
+        KeyCode::Char('A') => Some(Screen::Calls),
+        KeyCode::Char('F') => Some(Screen::KnownPeers),
+        KeyCode::Char('P') => Some(Screen::Peers),
+        KeyCode::Char('I') => Some(Screen::Config),
+        KeyCode::Char('S') => Some(Screen::SeenUsers),
+        KeyCode::Char('N') => Some(Screen::DiscoveredPeers),
+        _ => None,
+    }
+}
+
+fn cycle_tab(app: &mut UiApp, forward: bool) {
+    let current = active_tab_screen(app);
+    let index = tab_screens()
+        .iter()
+        .position(|screen| *screen == current)
+        .unwrap_or(0);
+    let next_index = if forward {
+        (index + 1) % tab_screens().len()
+    } else if index == 0 {
+        tab_screens().len() - 1
+    } else {
+        index - 1
+    };
+    navigate_to_screen(app, tab_screens()[next_index]);
+}
+
+fn active_tab_screen(app: &UiApp) -> Screen {
+    match app.screen {
+        Screen::Help => app.previous_screen,
+        screen => screen,
+    }
+}
+
+fn navigate_to_screen(app: &mut UiApp, screen: Screen) {
+    if app.screen == screen {
+        app.set_flash(default_flash(screen));
+        return;
+    }
+
+    if app.screen == Screen::Help {
+        app.previous_screen = screen;
+    } else {
+        app.previous_screen = app.screen;
+    }
+    app.screen = screen;
+    clamp_for_screen(app, screen);
+    app.set_flash(default_flash(screen));
+}
+
+fn clamp_for_screen(app: &mut UiApp, screen: Screen) {
+    match screen {
+        Screen::Main => app.clamp_main_selection(),
+        Screen::Peers => app.clamp_selection(),
+        Screen::Rooms => app.clamp_room_selection(),
+        Screen::Calls => app.clamp_call_selection(),
+        Screen::Config => app.clamp_config_selection(),
+        Screen::KnownPeers => app.clamp_known_peer_selection(),
+        Screen::SeenUsers => app.clamp_seen_user_selection(),
+        Screen::DiscoveredPeers => app.clamp_discovered_peer_selection(),
+        Screen::Help => {}
+    }
+}
+
+fn tab_screens() -> &'static [Screen] {
+    &[
+        Screen::Main,
+        Screen::Rooms,
+        Screen::Calls,
+        Screen::KnownPeers,
+        Screen::Peers,
+        Screen::Config,
+        Screen::SeenUsers,
+        Screen::DiscoveredPeers,
+    ]
 }
 
 async fn handle_main_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
@@ -324,10 +423,6 @@ async fn handle_rooms_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
         }
         KeyCode::Char('J') => {
             open_join_dialog(app);
-        }
-        KeyCode::Tab => {
-            app.input_mode = InputMode::ControlAddr;
-            app.set_flash_persistent("edit control addr and press Enter");
         }
         KeyCode::Char('m') => {
             let response =
@@ -572,6 +667,10 @@ async fn handle_config_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
         KeyCode::Char('s') => {
             launch_daemon(app, false);
             refresh_status(app).await;
+        }
+        KeyCode::Char('e') => {
+            app.input_mode = InputMode::ControlAddr;
+            app.set_flash_persistent("edit control addr and press Enter");
         }
         KeyCode::Char('j') | KeyCode::Down => {
             let len = app.config_items().len();
@@ -1787,19 +1886,19 @@ fn draw_summary(frame: &mut Frame, app: &UiApp, area: Rect) {
 
 fn draw_tabs(frame: &mut Frame, app: &UiApp, area: Rect) {
     let titles = vec![
-        Line::from("Main"),
-        Line::from("Rooms"),
-        Line::from("Calls"),
-        Line::from("Friends"),
-        Line::from("Peers"),
-        Line::from("Configuration"),
-        Line::from("Seen Users"),
-        Line::from("Network Peers"),
+        tab_title("Main", 0),
+        tab_title("Rooms", 1),
+        tab_title("Calls", 1),
+        tab_title("Friends", 0),
+        tab_title("Peers", 0),
+        tab_title("Configuration", 4),
+        tab_title("Seen Users", 0),
+        tab_title("Network Peers", 0),
     ];
 
     let tabs = Tabs::new(titles)
         .block(panel_block("Tabs", color_panel_alt()))
-        .select(current_tab_index(app.screen))
+        .select(current_tab_index(active_tab_screen(app)))
         .style(Style::default().fg(color_muted()))
         .highlight_style(
             Style::default()
@@ -1809,6 +1908,27 @@ fn draw_tabs(frame: &mut Frame, app: &UiApp, area: Rect) {
         )
         .divider(" ");
     frame.render_widget(tabs, area);
+}
+
+fn tab_title(label: &'static str, underlined_char_index: usize) -> Line<'static> {
+    let mut chars = label.chars();
+    let mut spans = Vec::new();
+
+    for index in 0..label.chars().count() {
+        let ch = chars
+            .next()
+            .expect("tab label char count should match iteration");
+        let style = if index == underlined_char_index {
+            Style::default()
+                .fg(color_text())
+                .add_modifier(Modifier::UNDERLINED | Modifier::BOLD)
+        } else {
+            Style::default().fg(color_muted())
+        };
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+
+    Line::from(spans)
 }
 
 fn current_tab_index(screen: Screen) -> usize {
@@ -3650,6 +3770,8 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
         Screen::Main => &[
             ("q", "Quit the TUI."),
             ("?", "Open this page-specific help."),
+            ("Tab / Shift+Tab", "Cycle forward or backward through the main tabs."),
+            ("M / O / A / F / P / I / S / N", "Jump directly to Main, Rooms, Calls, Friends, Peers, Configuration, Seen Users, or Network Peers."),
             ("d / J", "Open the join dialog and paste an invite code."),
             ("j / k or arrows", "Move the activity selection."),
             ("Enter", "Expand/collapse a group or open the relevant detailed page."),
@@ -3661,6 +3783,8 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
         Screen::Peers => &[
             ("q", "Quit the TUI."),
             ("?", "Open this page-specific help."),
+            ("Tab / Shift+Tab", "Cycle forward or backward through the main tabs."),
+            ("M / O / A / F / P / I / S / N", "Jump directly to the underlined tabs."),
             ("J", "Open the join dialog and paste an invite code."),
             ("j / k or arrows", "Move the selection."),
             ("x", "Mute or unmute the selected engaged user."),
@@ -3672,6 +3796,8 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
         Screen::Rooms => &[
             ("q", "Quit the TUI."),
             ("?", "Open this page-specific help."),
+            ("Tab / Shift+Tab", "Cycle forward or backward through the main tabs."),
+            ("M / O / A / F / P / I / S / N", "Jump directly to the underlined tabs."),
             ("j / k or arrows", "Move the selection."),
             ("d / J", "Open the join dialog and paste an invite code."),
             ("Enter", "Enter the selected room."),
@@ -3680,7 +3806,6 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
             ("C", "Rotate the room invite for your engaged custom room."),
             ("y / w / n", "Approve once, approve and whitelist, or reject a pending join."),
             ("m / u", "Toggle self mute or rename yourself."),
-            ("Tab", "Edit the daemon control address."),
             ("r / Esc", "Return to Main."),
             ("p / l / o / v / t", "Jump to Engaged Users, Calls, Friends, Seen Users, or Network Peers."),
             ("g", "Refresh status immediately."),
@@ -3688,6 +3813,8 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
         Screen::Calls => &[
             ("q", "Quit the TUI."),
             ("?", "Open this page-specific help."),
+            ("Tab / Shift+Tab", "Cycle forward or backward through the main tabs."),
+            ("M / O / A / F / P / I / S / N", "Jump directly to the underlined tabs."),
             ("J", "Open the join dialog and paste an invite code."),
             ("j / k or arrows", "Move the selection."),
             ("x", "Mute or unmute the selected call user."),
@@ -3700,10 +3827,13 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
         Screen::Config => &[
             ("q", "Quit the TUI."),
             ("?", "Open this page-specific help."),
+            ("Tab / Shift+Tab", "Cycle forward or backward through the main tabs."),
+            ("M / O / A / F / P / I / S / N", "Jump directly to the underlined tabs."),
             ("J", "Open the join dialog and paste an invite code."),
             ("j / k or arrows", "Move the selection."),
             ("h / l or arrows", "Lower or raise the selected value."),
             ("Enter", "Activate the selected capture device."),
+            ("e", "Edit the daemon control address."),
             ("u", "Rename yourself."),
             ("c / Esc", "Return to Main."),
             ("p / r / l / o / v / t", "Jump to Engaged Users, Rooms, Calls, Friends, Seen Users, or Network Peers."),
@@ -3712,6 +3842,8 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
         Screen::KnownPeers => &[
             ("q", "Quit the TUI."),
             ("?", "Open this page-specific help."),
+            ("Tab / Shift+Tab", "Cycle forward or backward through the main tabs."),
+            ("M / O / A / F / P / I / S / N", "Jump directly to the underlined tabs."),
             ("J", "Open the join dialog and paste an invite code."),
             ("j / k or arrows", "Move the selection."),
             ("Enter / d", "Reconnect to the selected friend."),
@@ -3725,6 +3857,8 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
         Screen::SeenUsers => &[
             ("q", "Quit the TUI."),
             ("?", "Open this page-specific help."),
+            ("Tab / Shift+Tab", "Cycle forward or backward through the main tabs."),
+            ("M / O / A / F / P / I / S / N", "Jump directly to the underlined tabs."),
             ("J", "Open the join dialog and paste an invite code."),
             ("j / k or arrows", "Move the selection."),
             ("Enter / d", "Reconnect to the selected seen user."),
@@ -3736,6 +3870,8 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
         Screen::DiscoveredPeers => &[
             ("q", "Quit the TUI."),
             ("?", "Open this page-specific help."),
+            ("Tab / Shift+Tab", "Cycle forward or backward through the main tabs."),
+            ("M / O / A / F / P / I / S / N", "Jump directly to the underlined tabs."),
             ("J", "Open the join dialog and paste an invite code."),
             ("j / k or arrows", "Move the selection."),
             ("Enter / d", "Dial the selected routing candidate by peer id."),
@@ -3746,6 +3882,8 @@ fn help_keybinds(screen: Screen) -> &'static [(&'static str, &'static str)] {
         Screen::Help => &[
             ("q", "Quit the TUI."),
             ("? / Esc", "Close help and return to the previous page."),
+            ("Tab / Shift+Tab", "Cycle forward or backward through the main tabs."),
+            ("M / O / A / F / P / I / S / N", "Jump directly to Main, Rooms, Calls, Friends, Peers, Configuration, Seen Users, or Network Peers."),
             ("g", "Refresh status immediately."),
         ],
     }

@@ -334,15 +334,25 @@ pub fn visible_voice_peers(status: &DaemonStatus) -> Vec<&PeerSummary> {
 
 pub fn default_flash(screen: Screen) -> &'static str {
     match screen {
-        Screen::Main => "main | ? keybinds | j/k move | Enter toggle/open | J join invite",
-        Screen::Peers => "engaged users | ? keybinds | x mute | a add friend",
-        Screen::Rooms => "rooms | ? keybinds | J join invite | Enter enter room",
-        Screen::Calls => "calls | ? keybinds | x mute | a add friend",
-        Screen::Config => "configuration | ? keybinds | h/l adjust | Enter activate",
-        Screen::KnownPeers => "friends | ? keybinds | Enter reconnect | D remove | t trust toggle",
-        Screen::SeenUsers => "seen users | ? keybinds | Enter reconnect | a add friend",
-        Screen::DiscoveredPeers => "network peers | ? keybinds | Enter inspect route candidate",
-        Screen::Help => "? or esc closes help",
+        Screen::Main => {
+            "main | Tab/Shift+Tab cycle tabs | M/O/A/F/P/I/S/N jump tabs | Enter toggle/open"
+        }
+        Screen::Peers => "engaged users | Tab/Shift+Tab cycle tabs | x mute | a add friend",
+        Screen::Rooms => "rooms | Tab/Shift+Tab cycle tabs | J join invite | Enter enter room",
+        Screen::Calls => "calls | Tab/Shift+Tab cycle tabs | x mute | a add friend",
+        Screen::Config => {
+            "configuration | Tab/Shift+Tab cycle tabs | h/l adjust | e edit control addr"
+        }
+        Screen::KnownPeers => {
+            "friends | Tab/Shift+Tab cycle tabs | Enter reconnect | D remove | t trust toggle"
+        }
+        Screen::SeenUsers => {
+            "seen users | Tab/Shift+Tab cycle tabs | Enter reconnect | a add friend"
+        }
+        Screen::DiscoveredPeers => {
+            "network peers | Tab/Shift+Tab cycle tabs | Enter inspect route candidate"
+        }
+        Screen::Help => "? or Esc closes help | Tab/Shift+Tab cycles tabs",
     }
 }
 

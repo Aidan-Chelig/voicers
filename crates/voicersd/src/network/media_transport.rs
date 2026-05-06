@@ -669,7 +669,10 @@ mod tests {
     fn resolve_route_direct_when_connected_even_if_not_trusted() {
         let status = make_route_status(vec![peer(TARGET, false, true)]);
         let offers = HashMap::new();
-        assert!(matches!(resolve_route(&status, &offers, TARGET), Route::Direct));
+        assert!(matches!(
+            resolve_route(&status, &offers, TARGET),
+            Route::Direct
+        ));
     }
 
     #[test]
