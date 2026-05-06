@@ -4,7 +4,10 @@ mod common;
 use std::{fs, path::PathBuf, time::Duration};
 
 use anyhow::{anyhow, Result};
-use voicers_core::{encode_room_compact_invite, ControlRequest, ControlResponse, DaemonStatus, PeerSessionState, PeerTransportState};
+use voicers_core::{
+    encode_room_compact_invite, ControlRequest, ControlResponse, DaemonStatus, PeerSessionState,
+    PeerTransportState,
+};
 use voicersd::app::{App, AppConfig};
 
 struct NetworkHarness {
@@ -33,7 +36,11 @@ impl NetworkHarness {
         })
         .await?;
         let peer_id = app.peer_id().await;
-        Ok(Self { app, peer_id, state_path })
+        Ok(Self {
+            app,
+            peer_id,
+            state_path,
+        })
     }
 
     async fn status(&self) -> Result<DaemonStatus> {
@@ -205,7 +212,8 @@ async fn unknown_peer_requires_approval() -> Result<()> {
         status
             .peers
             .iter()
-            .all(|p| p.peer_id != alice.peer_id || !matches!(p.transport, PeerTransportState::Connected)),
+            .all(|p| p.peer_id != alice.peer_id
+                || !matches!(p.transport, PeerTransportState::Connected)),
         "alice should not be Connected in bob's peers before approval"
     );
     Ok(())
@@ -274,7 +282,8 @@ async fn reject_peer_removes_from_pending() -> Result<()> {
         bob_status
             .peers
             .iter()
-            .all(|p| p.peer_id != alice.peer_id || !matches!(p.transport, PeerTransportState::Connected)),
+            .all(|p| p.peer_id != alice.peer_id
+                || !matches!(p.transport, PeerTransportState::Connected)),
         "alice should not be Connected in bob's peers after rejection"
     );
     Ok(())
@@ -604,15 +613,21 @@ async fn persisted_known_peer_survives_daemon_restart() -> Result<()> {
     app1.seed_peer_for_tests("peer-x", "xavier", "/ip4/127.0.0.1/tcp/9999")
         .await;
     common::expect_ack(
-        common::send_request(&app1, ControlRequest::SaveKnownPeer {
-            peer_id: "peer-x".to_string(),
-        })
+        common::send_request(
+            &app1,
+            ControlRequest::SaveKnownPeer {
+                peer_id: "peer-x".to_string(),
+            },
+        )
         .await?,
     )?;
     common::expect_ack(
-        common::send_request(&app1, ControlRequest::MarkTrustedContact {
-            peer_id: "peer-x".to_string(),
-        })
+        common::send_request(
+            &app1,
+            ControlRequest::MarkTrustedContact {
+                peer_id: "peer-x".to_string(),
+            },
+        )
         .await?,
     )?;
     drop(app1);
@@ -697,13 +712,20 @@ async fn room_join_unknown_guest_requires_approval() -> Result<()> {
     // Host must gate the unknown guest.
     host.wait_for_pending(&guest.peer_id, Duration::from_secs(5))
         .await
-        .map_err(|_| anyhow!("guest never appeared in host's pending_peer_approvals — approval gate bypassed"))?;
+        .map_err(|_| {
+            anyhow!(
+                "guest never appeared in host's pending_peer_approvals — approval gate bypassed"
+            )
+        })?;
 
     // Guest must NOT be connected yet.
     let guest_status = guest.status().await?;
     assert!(
-        !guest_status.peers.iter().any(|p| p.peer_id == host.peer_id
-            && matches!(p.transport, PeerTransportState::Connected)),
+        !guest_status
+            .peers
+            .iter()
+            .any(|p| p.peer_id == host.peer_id
+                && matches!(p.transport, PeerTransportState::Connected)),
         "guest should not be Connected before host approves"
     );
 
@@ -774,8 +796,11 @@ async fn room_join_approved_guest_reaches_connected() -> Result<()> {
 
     // Host sees guest as Connected.
     assert!(
-        host_status.peers.iter().any(|p| p.peer_id == guest.peer_id
-            && matches!(p.transport, PeerTransportState::Connected)),
+        host_status
+            .peers
+            .iter()
+            .any(|p| p.peer_id == guest.peer_id
+                && matches!(p.transport, PeerTransportState::Connected)),
         "host should see guest as Connected after approval"
     );
 
@@ -832,8 +857,11 @@ async fn room_join_rejected_guest_not_connected() -> Result<()> {
 
     let guest_status = guest.status().await?;
     assert!(
-        !guest_status.peers.iter().any(|p| p.peer_id == host.peer_id
-            && matches!(p.transport, PeerTransportState::Connected)),
+        !guest_status
+            .peers
+            .iter()
+            .any(|p| p.peer_id == host.peer_id
+                && matches!(p.transport, PeerTransportState::Connected)),
         "rejected guest should not be Connected"
     );
 

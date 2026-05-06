@@ -21,8 +21,8 @@ use ratatui::{
 };
 use ui::{
     model::{
-        active_call_peers, adjust_percent, best_known_peer_address, default_flash,
-        known_rooms, main_activity_items, parse_ui_config, ranked_fallback_candidates, short_id,
+        active_call_peers, adjust_percent, best_known_peer_address, default_flash, known_rooms,
+        main_activity_items, parse_ui_config, ranked_fallback_candidates, short_id,
         visible_voice_peers, ConfigItem, InputMode, MainActivityItem, Screen, UiApp, UiConfig,
     },
     theme::{
@@ -30,9 +30,7 @@ use ui::{
         color_subtle, color_text, color_warn, label, panel_block, transport_color, transport_label,
     },
 };
-use voicers_core::{
-    ControlRequest, ControlResponse, KnownPeerSummary, DEFAULT_CONTROL_ADDR,
-};
+use voicers_core::{ControlRequest, ControlResponse, KnownPeerSummary, DEFAULT_CONTROL_ADDR};
 
 const DEFAULT_ROOM_NAME: &str = "main";
 
@@ -169,7 +167,10 @@ async fn handle_main_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
             let len = app
                 .status
                 .as_ref()
-                .map(|status| main_activity_items(status, &app.expanded_main_rooms, app.expanded_main_calls).len())
+                .map(|status| {
+                    main_activity_items(status, &app.expanded_main_rooms, app.expanded_main_calls)
+                        .len()
+                })
                 .unwrap_or(0);
             if len > 0 {
                 app.selected_main_item = (app.selected_main_item + 1).min(len - 1);
@@ -309,7 +310,9 @@ async fn handle_rooms_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
                 .unwrap_or_else(|| "no room invite available yet".to_string());
             match copy_to_clipboard(&invite) {
                 Ok(()) => app.set_flash("room invite copied to clipboard"),
-                Err(error) => app.set_flash(format!("clipboard copy failed: {error}; invite: {invite}")),
+                Err(error) => {
+                    app.set_flash(format!("clipboard copy failed: {error}; invite: {invite}"))
+                }
             }
         }
         KeyCode::Char('R') => {
@@ -397,11 +400,11 @@ async fn handle_rooms_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
             }
         }
         KeyCode::Enter => {
-            if let Some(room) = app
-                .status
-                .as_ref()
-                .and_then(|status| known_rooms(status).get(app.selected_room).map(|room| room.name.clone()))
-            {
+            if let Some(room) = app.status.as_ref().and_then(|status| {
+                known_rooms(status)
+                    .get(app.selected_room)
+                    .map(|room| room.name.clone())
+            }) {
                 let response = client::send_request_to(
                     &app.control_addr,
                     ControlRequest::CreateRoom { room_name: room },
@@ -495,8 +498,11 @@ async fn handle_calls_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
         }
         KeyCode::Char('a') => {
             if let Some(peer_id) = app.selected_call_peer().map(|peer| peer.peer_id.clone()) {
-                let response =
-                    client::send_request_to(&app.control_addr, ControlRequest::SaveKnownPeer { peer_id }).await;
+                let response = client::send_request_to(
+                    &app.control_addr,
+                    ControlRequest::SaveKnownPeer { peer_id },
+                )
+                .await;
                 app.set_flash(render_message(response));
                 refresh_status(app).await;
             } else {
@@ -511,7 +517,9 @@ async fn handle_calls_screen(app: &mut UiApp, key: KeyCode) -> Result<bool> {
                 .unwrap_or_else(|| "no direct-call invite available yet".to_string());
             match copy_to_clipboard(&invite) {
                 Ok(()) => app.set_flash("direct-call invite copied to clipboard"),
-                Err(error) => app.set_flash(format!("clipboard copy failed: {error}; invite: {invite}")),
+                Err(error) => {
+                    app.set_flash(format!("clipboard copy failed: {error}; invite: {invite}"))
+                }
             }
         }
         KeyCode::Char('g') => {
@@ -923,8 +931,12 @@ async fn handle_text_input(app: &mut UiApp, key: KeyCode, mode: InputMode) {
         KeyCode::Char(ch) => match mode {
             InputMode::Dial => append_input_value(app, InputMode::Dial, &ch.to_string()),
             InputMode::Room => append_input_value(app, InputMode::Room, &ch.to_string()),
-            InputMode::ControlAddr => append_input_value(app, InputMode::ControlAddr, &ch.to_string()),
-            InputMode::RenameSelf => append_input_value(app, InputMode::RenameSelf, &ch.to_string()),
+            InputMode::ControlAddr => {
+                append_input_value(app, InputMode::ControlAddr, &ch.to_string())
+            }
+            InputMode::RenameSelf => {
+                append_input_value(app, InputMode::RenameSelf, &ch.to_string())
+            }
             InputMode::RenameKnownPeer => {
                 append_input_value(app, InputMode::RenameKnownPeer, &ch.to_string())
             }
@@ -1822,7 +1834,8 @@ fn draw_main_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
                 Style::default().fg(color_muted()),
             ))]
         } else {
-            items.into_iter()
+            items
+                .into_iter()
                 .map(|item| match item {
                     MainActivityItem::RoomGroup {
                         room_name,
@@ -1872,14 +1885,22 @@ fn draw_main_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::raw(" "),
-                            badge(format!("{active_calls} active"), color_panel_alt(), color_bg()),
+                            badge(
+                                format!("{active_calls} active"),
+                                color_panel_alt(),
+                                color_bg(),
+                            ),
                         ]))
                     }
                     MainActivityItem::CallPeer { peer } => ListItem::new(Line::from(vec![
                         Span::raw("   "),
                         Span::styled(peer.display_name, Style::default().fg(color_text())),
                         Span::raw(" "),
-                        badge(transport_label(&peer.transport), transport_color(&peer.transport), color_bg()),
+                        badge(
+                            transport_label(&peer.transport),
+                            transport_color(&peer.transport),
+                            color_bg(),
+                        ),
                     ])),
                 })
                 .collect()
@@ -1893,7 +1914,9 @@ fn draw_main_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
 
     let mut state = ListState::default();
     if let Some(status) = &app.status {
-        if !main_activity_items(status, &app.expanded_main_rooms, app.expanded_main_calls).is_empty() {
+        if !main_activity_items(status, &app.expanded_main_rooms, app.expanded_main_calls)
+            .is_empty()
+        {
             state.select(Some(app.selected_main_item.min(items.len() - 1)));
         }
     }
@@ -1920,7 +1943,9 @@ fn draw_main_details(frame: &mut Frame, app: &UiApp, area: Rect) {
             }) => vec![
                 Line::from(Span::styled(
                     room_name.clone(),
-                    Style::default().fg(color_text()).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(color_text())
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(vec![
@@ -1940,12 +1965,21 @@ fn draw_main_details(frame: &mut Frame, app: &UiApp, area: Rect) {
             Some(MainActivityItem::RoomPeer { room_name, peer }) => vec![
                 Line::from(Span::styled(
                     peer.display_name.clone(),
-                    Style::default().fg(color_text()).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(color_text())
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(vec![
-                    Span::styled(format!("@{}", short_id(&peer.peer_id)), Style::default().fg(color_muted())),
+                    Span::styled(
+                        format!("@{}", short_id(&peer.peer_id)),
+                        Style::default().fg(color_muted()),
+                    ),
                     Span::raw("  "),
-                    badge(transport_label(&peer.transport), transport_color(&peer.transport), color_bg()),
+                    badge(
+                        transport_label(&peer.transport),
+                        transport_color(&peer.transport),
+                        color_bg(),
+                    ),
                 ]),
                 Line::from(""),
                 Line::from(vec![
@@ -1964,7 +1998,9 @@ fn draw_main_details(frame: &mut Frame, app: &UiApp, area: Rect) {
             Some(MainActivityItem::CallsGroup { active_calls }) => vec![
                 Line::from(Span::styled(
                     "Calls",
-                    Style::default().fg(color_text()).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(color_text())
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(vec![
@@ -1984,12 +2020,21 @@ fn draw_main_details(frame: &mut Frame, app: &UiApp, area: Rect) {
             Some(MainActivityItem::CallPeer { peer }) => vec![
                 Line::from(Span::styled(
                     peer.display_name.clone(),
-                    Style::default().fg(color_text()).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(color_text())
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(vec![
-                    Span::styled(format!("@{}", short_id(&peer.peer_id)), Style::default().fg(color_muted())),
+                    Span::styled(
+                        format!("@{}", short_id(&peer.peer_id)),
+                        Style::default().fg(color_muted()),
+                    ),
                     Span::raw("  "),
-                    badge(transport_label(&peer.transport), transport_color(&peer.transport), color_bg()),
+                    badge(
+                        transport_label(&peer.transport),
+                        transport_color(&peer.transport),
+                        color_bg(),
+                    ),
                 ]),
                 Line::from(""),
                 Line::from(vec![
@@ -2015,7 +2060,6 @@ fn draw_main_details(frame: &mut Frame, app: &UiApp, area: Rect) {
 
     let widget = Paragraph::new(lines)
         .block(panel_block("Details", color_panel_alt()))
-
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, area);
 }
@@ -2040,11 +2084,7 @@ fn draw_home_panel(frame: &mut Frame, app: &UiApp, area: Rect) {
                 ),
                 Span::raw("  "),
                 badge(
-                    if invite_ready {
-                        "ready"
-                    } else {
-                        "preparing"
-                    },
+                    if invite_ready { "ready" } else { "preparing" },
                     if invite_ready {
                         color_good()
                     } else {
@@ -2053,7 +2093,10 @@ fn draw_home_panel(frame: &mut Frame, app: &UiApp, area: Rect) {
                     color_bg(),
                 ),
             ]),
-            Line::from(Span::styled(invite_preview, Style::default().fg(color_text()))),
+            Line::from(Span::styled(
+                invite_preview,
+                Style::default().fg(color_text()),
+            )),
             Line::from(vec![
                 label("KIND"),
                 Span::raw(" "),
@@ -2193,12 +2236,10 @@ fn draw_peer_list(frame: &mut Frame, app: &UiApp, area: Rect) {
     let items = if let Some(status) = &app.status {
         let visible_peers = visible_voice_peers(status);
         if visible_peers.is_empty() {
-            vec![ListItem::new(vec![
-                Line::from(Span::styled(
-                    "is anyone there?",
-                    Style::default().fg(color_muted()),
-                )),
-            ])]
+            vec![ListItem::new(vec![Line::from(Span::styled(
+                "is anyone there?",
+                Style::default().fg(color_muted()),
+            ))])]
         } else {
             visible_peers
                 .into_iter()
@@ -2350,7 +2391,10 @@ fn draw_live_peers_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
                                 Style::default().fg(color_muted()),
                             ),
                             Span::raw("  "),
-                            Span::styled(peer.output_bus.clone(), Style::default().fg(color_muted())),
+                            Span::styled(
+                                peer.output_bus.clone(),
+                                Style::default().fg(color_muted()),
+                            ),
                         ]),
                         Line::from(Span::styled(
                             peer.address.clone(),
@@ -2398,7 +2442,8 @@ fn draw_rooms_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
                 Style::default().fg(color_muted()),
             ))]
         } else {
-            rooms.into_iter()
+            rooms
+                .into_iter()
                 .map(|room| {
                     ListItem::new(vec![
                         Line::from(vec![
@@ -2425,12 +2470,10 @@ fn draw_rooms_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
                                 badge("idle", color_panel_alt(), color_bg())
                             },
                         ]),
-                        Line::from(vec![
-                            Span::styled(
-                                format!("{} pending approvals", room.pending_approvals),
-                                Style::default().fg(color_muted()),
-                            ),
-                        ]),
+                        Line::from(vec![Span::styled(
+                            format!("{} pending approvals", room.pending_approvals),
+                            Style::default().fg(color_muted()),
+                        )]),
                     ])
                 })
                 .collect()
@@ -2489,7 +2532,10 @@ fn draw_room_details(frame: &mut Frame, app: &UiApp, area: Rect) {
                 Line::from(vec![
                     label("ENGAGED"),
                     Span::raw(" "),
-                    Span::styled(room.engaged_users.to_string(), Style::default().fg(color_text())),
+                    Span::styled(
+                        room.engaged_users.to_string(),
+                        Style::default().fg(color_text()),
+                    ),
                 ]),
                 Line::from(vec![
                     label("PENDING"),
@@ -2514,7 +2560,9 @@ fn draw_room_details(frame: &mut Frame, app: &UiApp, area: Rect) {
             lines.push(Line::from(vec![
                 Span::styled(
                     "Pending Approval",
-                    Style::default().fg(color_text()).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(color_text())
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 badge("waiting", color_warn(), color_bg()),
@@ -2535,7 +2583,9 @@ fn draw_room_details(frame: &mut Frame, app: &UiApp, area: Rect) {
                     Span::styled(room_name.clone(), Style::default().fg(color_text())),
                 ]));
             }
-            lines.push(Line::from("Press y to allow once, w to allow+whitelist, n to reject."));
+            lines.push(Line::from(
+                "Press y to allow once, w to allow+whitelist, n to reject.",
+            ));
         }
         lines
     } else {
@@ -2564,9 +2614,9 @@ fn draw_calls_screen(frame: &mut Frame, app: &UiApp, area: Rect) {
                 .into_iter()
                 .map(|peer| {
                     let session_label = match &peer.session {
-                        voicers_core::PeerSessionState::Active { room_name, .. } => room_name
-                            .clone()
-                            .unwrap_or_else(|| "roomless".to_string()),
+                        voicers_core::PeerSessionState::Active { room_name, .. } => {
+                            room_name.clone().unwrap_or_else(|| "roomless".to_string())
+                        }
                         voicers_core::PeerSessionState::Handshaking => "handshaking".to_string(),
                         voicers_core::PeerSessionState::None => "transport".to_string(),
                     };
@@ -2676,7 +2726,10 @@ fn draw_call_details(frame: &mut Frame, app: &UiApp, area: Rect) {
                 ]),
             ];
             match &peer.session {
-                voicers_core::PeerSessionState::Active { room_name, display_name } => {
+                voicers_core::PeerSessionState::Active {
+                    room_name,
+                    display_name,
+                } => {
                     lines.push(Line::from(vec![
                         label("MODE"),
                         Span::raw(" "),

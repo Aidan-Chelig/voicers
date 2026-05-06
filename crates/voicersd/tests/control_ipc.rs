@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf};
 
 use anyhow::{anyhow, Result};
-use voicers_core::{ControlRequest, ControlResponse, DaemonStatus};
+use voicers_core::{encode_room_compact_invite, ControlRequest, ControlResponse, DaemonStatus};
 use voicersd::app::{App, AppConfig};
 
 #[path = "common/mod.rs"]
@@ -155,7 +155,10 @@ async fn mark_trusted_contact_sets_flag_in_known_peers() -> Result<()> {
         .iter()
         .find(|p| p.peer_id == "peer-a")
         .ok_or_else(|| anyhow!("peer-a not found in known_peers"))?;
-    assert!(peer.trusted_contact, "expected trusted_contact=true for peer-a");
+    assert!(
+        peer.trusted_contact,
+        "expected trusted_contact=true for peer-a"
+    );
 
     Ok(())
 }
@@ -203,7 +206,10 @@ async fn unmark_trusted_contact_clears_flag_in_known_peers() -> Result<()> {
         .iter()
         .find(|p| p.peer_id == "peer-a")
         .ok_or_else(|| anyhow!("peer-a not found in known_peers"))?;
-    assert!(!peer.trusted_contact, "expected trusted_contact=false for peer-a");
+    assert!(
+        !peer.trusted_contact,
+        "expected trusted_contact=false for peer-a"
+    );
 
     Ok(())
 }
@@ -289,7 +295,11 @@ async fn save_known_peer_populates_known_peers() -> Result<()> {
 
     let status = daemon.status().await?;
     assert!(
-        status.network.known_peers.iter().any(|p| p.peer_id == "peer-a"),
+        status
+            .network
+            .known_peers
+            .iter()
+            .any(|p| p.peer_id == "peer-a"),
         "peer-a should be in known_peers after SaveKnownPeer"
     );
 
@@ -369,7 +379,10 @@ async fn forget_known_peer_removes_from_known_peers() -> Result<()> {
         "peer-a should not be in friends after ForgetKnownPeer"
     );
     assert!(
-        status.network.ignored_peer_ids.contains(&"peer-a".to_string()),
+        status
+            .network
+            .ignored_peer_ids
+            .contains(&"peer-a".to_string()),
         "peer-a should be in ignored_peer_ids after ForgetKnownPeer"
     );
 
@@ -480,9 +493,7 @@ async fn rotate_invite_code_generates_new_code() -> Result<()> {
         .map(|i| i.invite_code.clone())
         .ok_or_else(|| anyhow!("no invite code on myroom before rotate"))?;
 
-    common::expect_ack(
-        common::send_request(&daemon.app, ControlRequest::RotateInviteCode).await?,
-    )?;
+    common::expect_ack(common::send_request(&daemon.app, ControlRequest::RotateInviteCode).await?)?;
 
     let status_after = daemon.status().await?;
     let code_after = status_after
@@ -493,7 +504,10 @@ async fn rotate_invite_code_generates_new_code() -> Result<()> {
         .map(|i| i.invite_code.clone())
         .ok_or_else(|| anyhow!("no invite code on myroom after rotate"))?;
 
-    assert_ne!(code_before, code_after, "invite code should change after RotateInviteCode");
+    assert_ne!(
+        code_before, code_after,
+        "invite code should change after RotateInviteCode"
+    );
 
     Ok(())
 }
@@ -502,12 +516,43 @@ async fn rotate_invite_code_generates_new_code() -> Result<()> {
 async fn rotate_invite_code_returns_error_without_active_room() -> Result<()> {
     let daemon = AppHarness::spawn("alice").await?;
 
-    let response =
-        common::send_request(&daemon.app, ControlRequest::RotateInviteCode).await?;
+    let response = common::send_request(&daemon.app, ControlRequest::RotateInviteCode).await?;
 
     assert!(
         matches!(response, ControlResponse::Error { .. }),
         "expected Error response, got {response:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn joining_room_invite_adopts_invited_room_before_dial() -> Result<()> {
+    let daemon = AppHarness::spawn("bob").await?;
+    let invite = encode_room_compact_invite(
+        "12D3KooWExamplePeer",
+        "local-demo",
+        &["/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWExamplePeer".to_string()],
+        "room123",
+        None,
+    );
+
+    let response = common::send_request(
+        &daemon.app,
+        ControlRequest::JoinPeer { address: invite },
+    )
+    .await?;
+
+    assert!(
+        matches!(response, ControlResponse::Error { .. }),
+        "expected dial failure with networking disabled, got {response:?}"
+    );
+
+    let status = daemon.status().await?;
+    assert_eq!(status.session.room_name.as_deref(), Some("local-demo"));
+    assert!(
+        status.rooms.iter().any(|room| room.name == "local-demo" && room.engaged),
+        "expected local-demo to be created and engaged after accepting room invite",
     );
 
     Ok(())

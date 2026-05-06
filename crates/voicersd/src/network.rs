@@ -12,9 +12,9 @@ use std::{
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::{
-    connection_limits, dcutr, identify, kad, kad::store::MemoryStore, multiaddr::Protocol,
-    noise, ping, relay, request_response, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, tls,
-    upnp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
+    connection_limits, dcutr, identify, kad, kad::store::MemoryStore, multiaddr::Protocol, noise,
+    ping, relay, request_response, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, tls, upnp,
+    yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
 };
 use serde_json;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -52,11 +52,11 @@ const MAX_ESTABLISHED_OUTGOING_CONNECTIONS: u32 = 24;
 const MAX_ESTABLISHED_INCOMING_CONNECTIONS: u32 = 12;
 const MAX_PENDING_OUTGOING_CONNECTIONS: u32 = 16;
 const MAX_PENDING_INCOMING_CONNECTIONS: u32 = 8;
+const SESSION_REQUEST_TIMEOUT_SECS: u64 = 5 * 60;
 const RENDEZVOUS_RECORD_PREFIX: &str = "/voicers/rendezvous/v1/";
 const DEFAULT_ROOM_NAMESPACE: &str = "main";
-const DEFAULT_BOOTSTRAP_ADDRS: &[&str] = &[
-    "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
-];
+const DEFAULT_BOOTSTRAP_ADDRS: &[&str] =
+    &["/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ"];
 const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun.l.google.com:19302",
     "stun1.l.google.com:19302",
@@ -172,7 +172,10 @@ impl NetworkHandle {
     pub async fn approve_pending_peer(&self, peer_id: String) -> Result<String> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
-            .send(NetworkCommand::ApprovePendingPeer { peer_id, response_tx })
+            .send(NetworkCommand::ApprovePendingPeer {
+                peer_id,
+                response_tx,
+            })
             .await
             .context("failed to send approve-peer command to network task")?;
 
@@ -184,7 +187,10 @@ impl NetworkHandle {
     pub async fn reject_pending_peer(&self, peer_id: String) -> Result<String> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
-            .send(NetworkCommand::RejectPendingPeer { peer_id, response_tx })
+            .send(NetworkCommand::RejectPendingPeer {
+                peer_id,
+                response_tx,
+            })
             .await
             .context("failed to send reject-peer command to network task")?;
 
@@ -305,12 +311,8 @@ pub async fn start(
                 limits: connection_limits::Behaviour::new(
                     connection_limits::ConnectionLimits::default()
                         .with_max_established(Some(MAX_ESTABLISHED_CONNECTIONS))
-                        .with_max_established_outgoing(Some(
-                            MAX_ESTABLISHED_OUTGOING_CONNECTIONS,
-                        ))
-                        .with_max_established_incoming(Some(
-                            MAX_ESTABLISHED_INCOMING_CONNECTIONS,
-                        ))
+                        .with_max_established_outgoing(Some(MAX_ESTABLISHED_OUTGOING_CONNECTIONS))
+                        .with_max_established_incoming(Some(MAX_ESTABLISHED_INCOMING_CONNECTIONS))
                         .with_max_pending_outgoing(Some(MAX_PENDING_OUTGOING_CONNECTIONS))
                         .with_max_pending_incoming(Some(MAX_PENDING_INCOMING_CONNECTIONS)),
                 ),
@@ -327,7 +329,8 @@ pub async fn start(
                 upnp: upnp::tokio::Behaviour::default(),
                 session: request_response::cbor::Behaviour::new(
                     [(SESSION_PROTOCOL, request_response::ProtocolSupport::Full)],
-                    request_response::Config::default(),
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(SESSION_REQUEST_TIMEOUT_SECS)),
                 ),
                 media: request_response::cbor::Behaviour::new(
                     [(MEDIA_PROTOCOL, request_response::ProtocolSupport::Full)],
@@ -643,7 +646,10 @@ async fn handle_command(
             ));
             let _ = response_tx.send(response);
         }
-        NetworkCommand::ApprovePendingPeer { peer_id, response_tx } => {
+        NetworkCommand::ApprovePendingPeer {
+            peer_id,
+            response_tx,
+        } => {
             let response = approve_pending_peer(
                 state,
                 swarm,
@@ -656,14 +662,12 @@ async fn handle_command(
             .await;
             let _ = response_tx.send(response);
         }
-        NetworkCommand::RejectPendingPeer { peer_id, response_tx } => {
-            let response = reject_pending_peer(
-                state,
-                swarm,
-                pending_inbound_approvals,
-                &peer_id,
-            )
-            .await;
+        NetworkCommand::RejectPendingPeer {
+            peer_id,
+            response_tx,
+        } => {
+            let response =
+                reject_pending_peer(state, swarm, pending_inbound_approvals, &peer_id).await;
             let _ = response_tx.send(response);
         }
         NetworkCommand::SendMediaFrame { peer_id } => {
@@ -675,7 +679,8 @@ async fn handle_command(
                 match route {
                     Route::Direct => {
                         #[cfg(feature = "webrtc-transport")]
-                        send_next_media_frame_webrtc_first(state, swarm, webrtc, media, &peer_id).await;
+                        send_next_media_frame_webrtc_first(state, swarm, webrtc, media, &peer_id)
+                            .await;
                         #[cfg(not(feature = "webrtc-transport"))]
                         send_next_media_frame(state, swarm, media, &peer_id).await;
                         {
@@ -688,7 +693,13 @@ async fn handle_command(
                     Route::Relayed { via, destination } => {
                         let self_peer_id = state.read().await.local_peer_id.clone();
                         if destination.to_string() == self_peer_id {
-                            push_note(state, format!("self-loop guard: refusing relayed frame to self for {peer_id}")).await;
+                            push_note(
+                                state,
+                                format!(
+                                    "self-loop guard: refusing relayed frame to self for {peer_id}"
+                                ),
+                            )
+                            .await;
                         } else {
                             let via_str = via.to_string();
                             send_frame_relayed_libp2p(state, swarm, media, via, destination).await;
@@ -735,7 +746,8 @@ async fn dial_peer(
                 .behaviour_mut()
                 .kad
                 .get_record(kad::RecordKey::new(&rendezvous_record_key(&peer_id)));
-            pending_rendezvous_lookups.insert(query_id, PendingRendezvousLookup::PeerId(peer_id.clone()));
+            pending_rendezvous_lookups
+                .insert(query_id, PendingRendezvousLookup::PeerId(peer_id.clone()));
             push_note(
                 state,
                 format!("resolving rendezvous record for {peer_id} through the DHT"),
@@ -1197,8 +1209,7 @@ async fn handle_swarm_event(
                 // be promoted to Connected here — that would bypass the approval gate.
                 if should_surface_approved_peer(&state, &peer_id.to_string()) {
                     let identified_peer = {
-                        let peer =
-                            get_or_insert_peer(&mut state, peer_id.to_string(), remote_addr);
+                        let peer = get_or_insert_peer(&mut state, peer_id.to_string(), remote_addr);
                         peer.display_name = if agent_version.is_empty() {
                             format!("peer {}", short_peer_id(&peer.peer_id))
                         } else {
@@ -1362,25 +1373,35 @@ async fn handle_swarm_event(
                 kad::QueryResult::PutRecord(Ok(_)) => {
                     if let Some((key, payload)) = pending_rendezvous_publications.remove(&id) {
                         published_rendezvous_records.insert(key, payload);
-                        push_note(state, "published rendezvous record to the DHT".to_string()).await;
+                        push_note(state, "published rendezvous record to the DHT".to_string())
+                            .await;
                     }
                 }
                 kad::QueryResult::PutRecord(Err(error)) => {
                     pending_rendezvous_publications.remove(&id);
-                    push_note(state, format!("rendezvous record publication failed: {error}")).await;
+                    push_note(
+                        state,
+                        format!("rendezvous record publication failed: {error}"),
+                    )
+                    .await;
                 }
                 kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(peer_record))) => {
                     if let Some(invite) = decode_rendezvous_record(&peer_record.record.value) {
                         if let Some(lookup) = pending_rendezvous_lookups.get_mut(&id) {
                             match lookup {
                                 PendingRendezvousLookup::PeerId(requested_peer_id) => {
-                                    if invite.peer_id == *requested_peer_id && !invite.addrs.is_empty() {
+                                    if invite.peer_id == *requested_peer_id
+                                        && !invite.addrs.is_empty()
+                                    {
                                         seed_rendezvous_invite(state, &invite).await;
                                         let requested_peer_id = requested_peer_id.clone();
                                         pending_rendezvous_lookups.remove(&id);
                                         let ranked = {
                                             let state = state.read().await;
-                                            resolve_ranked_dial_target(&state.network, &requested_peer_id)
+                                            resolve_ranked_dial_target(
+                                                &state.network,
+                                                &requested_peer_id,
+                                            )
                                         };
                                         match ranked.primary.parse::<Multiaddr>() {
                                             Ok(multiaddr) => {
@@ -1415,7 +1436,10 @@ async fn handle_swarm_event(
                                         seed_rendezvous_invite(state, &invite).await;
                                         let ranked = {
                                             let state = state.read().await;
-                                            resolve_ranked_dial_target(&state.network, &invite.peer_id)
+                                            resolve_ranked_dial_target(
+                                                &state.network,
+                                                &invite.peer_id,
+                                            )
                                         };
                                         match ranked.primary.parse::<Multiaddr>() {
                                             Ok(multiaddr) => {
@@ -1453,7 +1477,9 @@ async fn handle_swarm_event(
                         }
                     }
                 }
-                kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. })) => {
+                kad::QueryResult::GetRecord(Ok(
+                    kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. },
+                )) => {
                     if let Some(lookup) = pending_rendezvous_lookups.remove(&id) {
                         match lookup {
                             PendingRendezvousLookup::PeerId(requested_peer_id) => {
@@ -1609,7 +1635,10 @@ async fn handle_swarm_event(
                 let peer_str = peer.to_string();
                 let already_connected = {
                     let s = state.read().await;
-                    s.peers.iter().any(|p| p.peer_id == peer_str && matches!(p.transport, PeerTransportState::Connected))
+                    s.peers.iter().any(|p| {
+                        p.peer_id == peer_str
+                            && matches!(p.transport, PeerTransportState::Connected)
+                    })
                 };
                 if already_connected || !should_gate_peer_approval(state, &peer_str).await {
                     relay_offers.insert(peer_str.clone(), hello.trusted_contacts.clone());
@@ -1804,7 +1833,9 @@ async fn handle_swarm_event(
                         Err(error) => {
                             push_note(
                                 state,
-                                format!("media engine failed for relayed frame from {peer}: {error}"),
+                                format!(
+                                    "media engine failed for relayed frame from {peer}: {error}"
+                                ),
                             )
                             .await;
                         }
@@ -1831,10 +1862,10 @@ async fn handle_swarm_event(
                             queue_depth: 0,
                             queued_samples: 0,
                         };
-                        let _ = swarm.behaviour_mut().media.send_response(
-                            channel,
-                            MediaResponse::RelayAck { destination, ack },
-                        );
+                        let _ = swarm
+                            .behaviour_mut()
+                            .media
+                            .send_response(channel, MediaResponse::RelayAck { destination, ack });
                     } else {
                         let _ = swarm.behaviour_mut().media.send_response(
                             channel,
@@ -1879,7 +1910,11 @@ async fn handle_swarm_event(
                 }
             }
             request_response::Message::Response {
-                response: MediaResponse::RelayDenied { destination, reason },
+                response:
+                    MediaResponse::RelayDenied {
+                        destination,
+                        reason,
+                    },
                 ..
             } => {
                 push_note(
@@ -2086,13 +2121,15 @@ async fn queue_pending_peer_approval(
             .iter()
             .any(|pending| pending.peer_id == peer_id)
         {
-            state.pending_peer_approvals.push(voicers_core::PendingPeerApprovalSummary {
-                peer_id: peer_id.to_string(),
-                display_name: hello.display_name.clone(),
-                address,
-                room_name: hello.room_name.clone(),
-                known,
-            });
+            state
+                .pending_peer_approvals
+                .push(voicers_core::PendingPeerApprovalSummary {
+                    peer_id: peer_id.to_string(),
+                    display_name: hello.display_name.clone(),
+                    address,
+                    room_name: hello.room_name.clone(),
+                    known,
+                });
         }
     }
     push_note(
@@ -2128,7 +2165,11 @@ async fn apply_approved_session_hello(
                 .collect(),
         })
     };
-    if let Err(response) = swarm.behaviour_mut().session.send_response(channel, response) {
+    if let Err(response) = swarm
+        .behaviour_mut()
+        .session
+        .send_response(channel, response)
+    {
         push_note(
             state,
             format!("failed to send session response to {peer_id}: {response:?}"),
@@ -2487,7 +2528,11 @@ async fn maybe_publish_rendezvous_record(
         }
 
         let record = kad::Record::new(key.clone().into_bytes(), payload.clone());
-        match swarm.behaviour_mut().kad.put_record(record, kad::Quorum::One) {
+        match swarm
+            .behaviour_mut()
+            .kad
+            .put_record(record, kad::Quorum::One)
+        {
             Ok(query_id) => {
                 pending_rendezvous_publications.insert(query_id, (key, payload));
             }
@@ -2568,11 +2613,9 @@ fn remove_addr(addresses: &mut Vec<String>, address: &str) {
 
 pub(crate) fn update_share_invite(state: &mut DaemonStatus) {
     state.network.direct_call_invite = best_direct_call_invite(state).or_else(|| {
-        state
-            .network
-            .direct_call_invite
-            .clone()
-            .filter(|invite| !invite.is_empty() && shareable_address(invite, &state.local_peer_id).is_some())
+        state.network.direct_call_invite.clone().filter(|invite| {
+            !invite.is_empty() && shareable_address(invite, &state.local_peer_id).is_some()
+        })
     });
 
     let room_invite_update = state
@@ -2580,9 +2623,12 @@ pub(crate) fn update_share_invite(state: &mut DaemonStatus) {
         .iter()
         .find(|room| room.engaged)
         .and_then(|room| {
-            room.current_invite
-                .as_ref()
-                .map(|invite| (room.name.clone(), best_room_invite(state, room.name.as_str(), invite)))
+            room.current_invite.as_ref().map(|invite| {
+                (
+                    room.name.clone(),
+                    best_room_invite(state, room.name.as_str(), invite),
+                )
+            })
         });
 
     if let Some((room_name, share_invite)) = room_invite_update {
@@ -2665,7 +2711,12 @@ fn best_direct_call_invite(state: &DaemonStatus) -> Option<String> {
     if addrs.is_empty() {
         None
     } else {
-        Some(encode_peer_compact_invite(local_peer_id, &addrs, None, None))
+        Some(encode_peer_compact_invite(
+            local_peer_id,
+            &addrs,
+            None,
+            None,
+        ))
     }
 }
 
@@ -2773,7 +2824,11 @@ fn is_supported_dial_addr(address: &Multiaddr) -> bool {
 
     for protocol in address.iter() {
         match protocol {
-            Protocol::Ip4(_) | Protocol::Ip6(_) | Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) => {
+            Protocol::Ip4(_)
+            | Protocol::Ip6(_)
+            | Protocol::Dns(_)
+            | Protocol::Dns4(_)
+            | Protocol::Dns6(_) => {
                 has_host = true;
             }
             Protocol::Tcp(_) => {
@@ -2840,9 +2895,8 @@ mod tests {
     };
     use libp2p::Multiaddr;
     use voicers_core::{
-        parse_join_target, AudioBackend, AudioEngineStage, AudioSummary, DaemonStatus,
-        JoinTarget, NetworkSummary, OutputStrategy, PeerSummary, PendingPeerApprovalSummary,
-        SessionSummary,
+        parse_join_target, AudioBackend, AudioEngineStage, AudioSummary, DaemonStatus, JoinTarget,
+        NetworkSummary, OutputStrategy, PeerSummary, PendingPeerApprovalSummary, SessionSummary,
     };
 
     #[test]

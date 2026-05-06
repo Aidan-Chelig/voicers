@@ -342,7 +342,10 @@ pub struct MediaAck {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MediaRequest {
     Frame(MediaFrame),
-    RelayedFrame { destination: String, frame: MediaFrame },
+    RelayedFrame {
+        destination: String,
+        frame: MediaFrame,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

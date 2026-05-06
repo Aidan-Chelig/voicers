@@ -1,25 +1,31 @@
-use std::{
-    path::PathBuf,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+mod peer_book;
+mod state;
+
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use tokio::sync::RwLock;
 use voicers_core::{
     parse_join_target, AudioBackend, AudioEngineStage, AudioSummary, CompactInviteKind,
-    CompactInviteV1, ControlRequest, ControlResponse, DaemonStatus, JoinTarget, NetworkSummary,
-    OutputStrategy, RoomInviteSummary, RoomMemberSummary, RoomPermission, RoomRoleSummary,
-    RoomSummary, SessionHello, SessionSummary, DEFAULT_CONTROL_ADDR,
+    ControlRequest, ControlResponse, DaemonStatus, JoinTarget, NetworkSummary, OutputStrategy,
+    RoomPermission, RoomSummary, SessionSummary, DEFAULT_CONTROL_ADDR,
 };
 
+use crate::network::update_share_invite;
 #[cfg(feature = "webrtc-transport")]
 use crate::webrtc_transport::{self, WebRtcTransportConfig};
-use crate::network::update_share_invite;
 use crate::{
     media,
     network::{self, NetworkHandle},
-    persist::{self, PersistedState, PersistenceHandle},
+    persist::{self, PersistenceHandle},
+};
+use peer_book::{
+    forget_known_peer, rename_known_peer, save_known_peer, seed_invite_hints, set_trusted_contact,
+};
+use state::{
+    build_local_hello, clear_room_invite, create_or_update_room, fresh_invite_code,
+    normalize_room_name, now_ms, persisted_state_from_network, persisted_state_from_status,
+    room_has_permission, set_room_invite, sync_local_room_memberships,
 };
 
 #[derive(Debug, Clone)]
@@ -232,470 +238,50 @@ impl App {
     pub async fn handle_request(&self, request: ControlRequest) -> ControlResponse {
         match request {
             ControlRequest::GetStatus => ControlResponse::Status(self.status().await),
-            ControlRequest::CreateRoom { room_name } => {
-                let mut state = self.state.write().await;
-                let normalized_room = normalize_room_name(&room_name);
-                let local_peer_id = state.local_peer_id.clone();
-                let display_name = state.session.display_name.clone();
-                engage_room(&mut state, &normalized_room, &local_peer_id, &display_name);
-                state.session.room_name = Some(normalized_room.clone());
-                if normalized_room != "main" && !normalized_room.is_empty() {
-                    let (invite_code, expires_at_ms) = fresh_invite_code(&state.local_peer_id);
-                    set_room_invite(
-                        &mut state,
-                        &normalized_room,
-                        invite_code.clone(),
-                        Some(expires_at_ms),
-                    );
-                } else {
-                    clear_room_invite(&mut state, &normalized_room);
-                }
-                update_share_invite(&mut state);
-                let hello = build_local_hello(&state);
-                drop(state);
-                let _ = self.network.broadcast_session_hello(hello).await;
-                let _ = self.persist_state().await;
-                ControlResponse::Ack {
-                    message: format!("room set to {normalized_room}"),
-                }
-            }
-            ControlRequest::JoinPeer { address } => {
-                let dial_target = match parse_join_target(&address) {
-                    JoinTarget::Raw(target) => target,
-                    JoinTarget::Invite(invite) => {
-                        let has_addrs = !invite.addrs.is_empty();
-                        let code_target = match invite.kind {
-                            CompactInviteKind::DirectCall => None,
-                            // If the invite carries addresses, dial the peer directly (the
-                            // addresses are seeded below). Fall back to DHT-based room/code
-                            // lookup only when no direct address is available.
-                            CompactInviteKind::Room if !has_addrs => invite
-                                .invite_code
-                                .clone()
-                                .filter(|_| invite.expires_at_ms.unwrap_or(u64::MAX) > now_ms())
-                                .or_else(|| invite.room_name.clone()),
-                            CompactInviteKind::Room => None,
-                        };
-                        let peer_id = invite.peer_id.clone();
-                        self.seed_invite_hints(invite).await;
-                        code_target.unwrap_or(peer_id)
-                    }
-                };
-                match self.network.dial(dial_target).await {
-                    Ok(message) => ControlResponse::Ack { message },
-                    Err(error) => ControlResponse::Error {
-                        message: error.to_string(),
-                    },
-                }
-            }
-            ControlRequest::ToggleMuteSelf => {
-                let mut state = self.state.write().await;
-                state.session.self_muted = !state.session.self_muted;
-                let label = if state.session.self_muted {
-                    "self muted"
-                } else {
-                    "self unmuted"
-                };
-
-                ControlResponse::Ack {
-                    message: label.to_string(),
-                }
-            }
+            ControlRequest::CreateRoom { room_name } => self.handle_create_room(room_name).await,
+            ControlRequest::JoinPeer { address } => self.handle_join_peer(address).await,
+            ControlRequest::ToggleMuteSelf => self.handle_toggle_mute_self().await,
             ControlRequest::ToggleMutePeer { peer_id } => {
-                let mut state = self.state.write().await;
-
-                match state.peers.iter_mut().find(|peer| peer.peer_id == peer_id) {
-                    Some(peer) => {
-                        peer.muted = !peer.muted;
-                        let label = if peer.muted { "muted" } else { "unmuted" };
-
-                        ControlResponse::Ack {
-                            message: format!("{} {label}", peer.display_name),
-                        }
-                    }
-                    None => ControlResponse::Error {
-                        message: "peer not found".to_string(),
-                    },
-                }
+                self.handle_toggle_mute_peer(peer_id).await
             }
             ControlRequest::SetDisplayName { display_name } => {
-                let new_name = display_name.trim().to_string();
-                if new_name.is_empty() {
-                    return ControlResponse::Error {
-                        message: "display name cannot be empty".to_string(),
-                    };
-                }
-                let hello = {
-                    let mut state = self.state.write().await;
-                    state.session.display_name = new_name.clone();
-                    let local_peer_id = state.local_peer_id.clone();
-                    let display_name = state.session.display_name.clone();
-                    sync_local_room_memberships(&mut state.rooms, &local_peer_id, &display_name);
-                    build_local_hello(&state)
-                };
-                let _ = self.network.broadcast_session_hello(hello).await;
-                let _ = self.persist_state().await;
-                ControlResponse::Ack {
-                    message: format!("nickname set to {new_name}"),
-                }
+                self.handle_set_display_name(display_name).await
             }
             ControlRequest::SendWebRtcSignal { peer_id, signal } => {
-                let signal_kind = signal.kind();
-                match self
-                    .network
-                    .send_webrtc_signal(peer_id.clone(), signal)
-                    .await
-                {
-                    Ok(()) => ControlResponse::Ack {
-                        message: format!("sent WebRTC {signal_kind} signal to {peer_id}"),
-                    },
-                    Err(error) => ControlResponse::Error {
-                        message: error.to_string(),
-                    },
-                }
+                self.handle_send_webrtc_signal(peer_id, signal).await
             }
             ControlRequest::StartWebRtcOffer { peer_id } => {
-                match self.network.start_webrtc_offer(peer_id.clone()).await {
-                    Ok(()) => ControlResponse::Ack {
-                        message: format!("started WebRTC offer for {peer_id}"),
-                    },
-                    Err(error) => ControlResponse::Error {
-                        message: error.to_string(),
-                    },
-                }
+                self.handle_start_webrtc_offer(peer_id).await
             }
             ControlRequest::SetInputGainPercent { percent } => {
-                let percent = percent.min(200);
-                match self.media.set_input_gain_percent(percent).await {
-                    Ok(()) => {
-                        let mut state = self.state.write().await;
-                        state.audio.input_gain_percent = percent;
-                        ControlResponse::Ack {
-                            message: format!("input gain set to {percent}%"),
-                        }
-                    }
-                    Err(error) => ControlResponse::Error {
-                        message: error.to_string(),
-                    },
-                }
+                self.handle_set_input_gain_percent(percent).await
             }
             ControlRequest::SelectCaptureDevice { device_name } => {
-                match self.media.select_capture_device(device_name.clone()).await {
-                    Ok(selected_name) => {
-                        let mut state = self.state.write().await;
-                        state.audio.capture_device = Some(selected_name.clone());
-                        ControlResponse::Ack {
-                            message: format!("capture device set to {selected_name}"),
-                        }
-                    }
-                    Err(error) => ControlResponse::Error {
-                        message: error.to_string(),
-                    },
-                }
+                self.handle_select_capture_device(device_name).await
             }
             ControlRequest::SetPeerVolumePercent { peer_id, percent } => {
-                let percent = percent.min(200);
-                let mut state = self.state.write().await;
-                match state.peers.iter_mut().find(|peer| peer.peer_id == peer_id) {
-                    Some(peer) => {
-                        peer.output_volume_percent = percent;
-                        ControlResponse::Ack {
-                            message: format!("{} volume set to {percent}%", peer.display_name),
-                        }
-                    }
-                    None => ControlResponse::Error {
-                        message: "peer not found".to_string(),
-                    },
-                }
+                self.handle_set_peer_volume_percent(peer_id, percent).await
             }
-            ControlRequest::SaveKnownPeer { peer_id } => {
-                let mut state = self.state.write().await;
-                let live_peer = state
-                    .peers
-                    .iter()
-                    .find(|peer| peer.peer_id == peer_id)
-                    .cloned();
-                state.network.ignored_peer_ids.retain(|id| id != &peer_id);
-                let known_peer = if let Some(existing) = state
-                    .network
-                    .known_peers
-                    .iter_mut()
-                    .find(|peer| peer.peer_id == peer_id)
-                {
-                    existing.pinned = true;
-                    existing.seen |= matches!(
-                        existing.connected,
-                        true
-                    ) && false;
-                    if let Some(live_peer) = &live_peer {
-                        existing.display_name = live_peer.display_name.clone();
-                        existing.seen |= matches!(
-                            live_peer.session,
-                            voicers_core::PeerSessionState::Active { .. }
-                        );
-                        if !live_peer.address.is_empty() && live_peer.address != "<unknown>" {
-                            if !existing.addresses.contains(&live_peer.address) {
-                                existing.addresses.push(live_peer.address.clone());
-                            }
-                            existing.last_dial_addr = Some(live_peer.address.clone());
-                        }
-                    }
-                    existing.display_name.clone()
-                } else if let Some(live_peer) = live_peer {
-                    state
-                        .network
-                        .known_peers
-                        .push(voicers_core::KnownPeerSummary {
-                            peer_id: live_peer.peer_id.clone(),
-                            display_name: live_peer.display_name.clone(),
-                            addresses: if live_peer.address != "<unknown>" {
-                                vec![live_peer.address.clone()]
-                            } else {
-                                Vec::new()
-                            },
-                            last_dial_addr: (live_peer.address != "<unknown>")
-                                .then_some(live_peer.address.clone()),
-                            connected: matches!(
-                                live_peer.transport,
-                                voicers_core::PeerTransportState::Connected
-                            ),
-                            pinned: true,
-                            seen: matches!(
-                                live_peer.session,
-                                voicers_core::PeerSessionState::Active { .. }
-                            ),
-                            whitelisted: false,
-                            trusted_contact: false,
-                        });
-                    live_peer.display_name
-                } else {
-                    return ControlResponse::Error {
-                        message: "peer not found".to_string(),
-                    };
-                };
-                state.network.refresh_user_views();
-                let snapshot = state.network.clone();
-                let local_display_name = state.session.display_name.clone();
-                let rooms = state.rooms.clone();
-                drop(state);
-                let _ = self.persist_network(local_display_name, rooms, snapshot);
-                ControlResponse::Ack {
-                    message: format!("{known_peer} added to friends"),
-                }
-            }
+            ControlRequest::SaveKnownPeer { peer_id } => self.handle_save_known_peer(peer_id).await,
             ControlRequest::RenameKnownPeer {
                 peer_id,
                 display_name,
-            } => {
-                let new_name = display_name.trim().to_string();
-                if new_name.is_empty() {
-                    return ControlResponse::Error {
-                        message: "display name cannot be empty".to_string(),
-                    };
-                }
-                let mut state = self.state.write().await;
-                let mut renamed = false;
-                if let Some(known_peer) = state
-                    .network
-                    .known_peers
-                    .iter_mut()
-                    .find(|peer| peer.peer_id == peer_id)
-                {
-                    known_peer.display_name = new_name.clone();
-                    known_peer.pinned = true;
-                    renamed = true;
-                }
-                if let Some(peer) = state.peers.iter_mut().find(|peer| peer.peer_id == peer_id) {
-                    peer.display_name = new_name.clone();
-                    renamed = true;
-                }
-                if !renamed {
-                    return ControlResponse::Error {
-                        message: "known peer not found".to_string(),
-                    };
-                }
-                state.network.refresh_user_views();
-                let snapshot = state.network.clone();
-                let local_display_name = state.session.display_name.clone();
-                let rooms = state.rooms.clone();
-                drop(state);
-                let _ = self.persist_network(local_display_name, rooms, snapshot);
-                ControlResponse::Ack {
-                    message: format!("friend renamed to {new_name}"),
-                }
-            }
+            } => self.handle_rename_known_peer(peer_id, display_name).await,
             ControlRequest::ForgetKnownPeer { peer_id } => {
-                let mut state = self.state.write().await;
-                let Some(known_peer) = state
-                    .network
-                    .known_peers
-                    .iter_mut()
-                    .find(|peer| peer.peer_id == peer_id)
-                else {
-                    return ControlResponse::Error {
-                        message: "known peer not found".to_string(),
-                    };
-                };
-                known_peer.pinned = false;
-                state.network.refresh_user_views();
-                if !state.network.ignored_peer_ids.contains(&peer_id) {
-                    state.network.ignored_peer_ids.push(peer_id);
-                }
-                let snapshot = state.network.clone();
-                let local_display_name = state.session.display_name.clone();
-                let rooms = state.rooms.clone();
-                drop(state);
-                let _ = self.persist_network(local_display_name, rooms, snapshot);
-                ControlResponse::Ack {
-                    message: "friend removed".to_string(),
-                }
+                self.handle_forget_known_peer(peer_id).await
             }
             ControlRequest::ApprovePendingPeer { peer_id, whitelist } => {
-                let response = self.network.approve_pending_peer(peer_id.clone()).await;
-                if response.is_ok() && whitelist {
-                    {
-                        let mut state = self.state.write().await;
-                        if let Some(peer) = state
-                            .network
-                            .known_peers
-                            .iter_mut()
-                            .find(|peer| peer.peer_id == peer_id)
-                        {
-                            peer.whitelisted = true;
-                        }
-                        state.network.refresh_user_views();
-                        state
-                            .pending_peer_approvals
-                            .retain(|pending| pending.peer_id != peer_id);
-                    }
-                    let _ = self.persist_state().await;
-                } else if response.is_ok() {
-                    let mut state = self.state.write().await;
-                    state
-                        .pending_peer_approvals
-                        .retain(|pending| pending.peer_id != peer_id);
-                }
-                match response {
-                    Ok(message) => ControlResponse::Ack { message: if whitelist {
-                        format!("{message}; peer whitelisted")
-                    } else {
-                        message
-                    }},
-                    Err(error) => ControlResponse::Error { message: error.to_string() },
-                }
+                self.handle_approve_pending_peer(peer_id, whitelist).await
             }
             ControlRequest::RejectPendingPeer { peer_id } => {
-                let response = self.network.reject_pending_peer(peer_id.clone()).await;
-                if response.is_ok() {
-                    let mut state = self.state.write().await;
-                    state
-                        .pending_peer_approvals
-                        .retain(|pending| pending.peer_id != peer_id);
-                }
-                match response {
-                    Ok(message) => ControlResponse::Ack { message },
-                    Err(error) => ControlResponse::Error { message: error.to_string() },
-                }
+                self.handle_reject_pending_peer(peer_id).await
             }
-            ControlRequest::RotateInviteCode => {
-                let mut state = self.state.write().await;
-                if state.session.room_name.as_deref() == Some("main")
-                    || state.session.room_name.as_deref().unwrap_or_default().is_empty()
-                {
-                    return ControlResponse::Error {
-                        message: "room invite rotation requires a custom room name".to_string(),
-                    };
-                }
-                let current_room = state
-                    .session
-                    .room_name
-                    .clone()
-                    .unwrap_or_else(|| "main".to_string());
-                if !room_has_permission(&state, &current_room, &state.local_peer_id, RoomPermission::CreateRoomInvite)
-                {
-                    return ControlResponse::Error {
-                        message: "only room admins can create room invites".to_string(),
-                    };
-                }
-                let (invite_code, expires_at_ms) = fresh_invite_code(&state.local_peer_id);
-                set_room_invite(
-                    &mut state,
-                    &current_room,
-                    invite_code.clone(),
-                    Some(expires_at_ms),
-                );
-                update_share_invite(&mut state);
-                let hello = build_local_hello(&state);
-                drop(state);
-                let _ = self.network.broadcast_session_hello(hello).await;
-                let _ = self.persist_state().await;
-                ControlResponse::Ack {
-                    message: format!("room invite rotated to {invite_code}"),
-                }
-            }
+            ControlRequest::RotateInviteCode => self.handle_rotate_invite_code().await,
             ControlRequest::MarkTrustedContact { peer_id } => {
-                let hello = {
-                    let mut state = self.state.write().await;
-                    if let Some(peer) = state
-                        .network
-                        .known_peers
-                        .iter_mut()
-                        .find(|p| p.peer_id == peer_id)
-                    {
-                        peer.trusted_contact = true;
-                    } else {
-                        return ControlResponse::Error {
-                            message: "peer not found in known peers".to_string(),
-                        };
-                    }
-                    state.network.refresh_user_views();
-                    build_local_hello(&state)
-                };
-                let snapshot = {
-                    let state = self.state.read().await;
-                    (
-                        state.session.display_name.clone(),
-                        state.rooms.clone(),
-                        state.network.clone(),
-                    )
-                };
-                let _ = self.persist_network(snapshot.0, snapshot.1, snapshot.2);
-                let _ = self.network.broadcast_session_hello(hello).await;
-                ControlResponse::Ack {
-                    message: format!("{peer_id} marked as trusted contact"),
-                }
+                self.handle_set_trusted_contact(peer_id, true).await
             }
             ControlRequest::UnmarkTrustedContact { peer_id } => {
-                let hello = {
-                    let mut state = self.state.write().await;
-                    if let Some(peer) = state
-                        .network
-                        .known_peers
-                        .iter_mut()
-                        .find(|p| p.peer_id == peer_id)
-                    {
-                        peer.trusted_contact = false;
-                    } else {
-                        return ControlResponse::Error {
-                            message: "peer not found in known peers".to_string(),
-                        };
-                    }
-                    state.network.refresh_user_views();
-                    build_local_hello(&state)
-                };
-                let snapshot = {
-                    let state = self.state.read().await;
-                    (
-                        state.session.display_name.clone(),
-                        state.rooms.clone(),
-                        state.network.clone(),
-                    )
-                };
-                let _ = self.persist_network(snapshot.0, snapshot.1, snapshot.2);
-                let _ = self.network.broadcast_session_hello(hello).await;
-                ControlResponse::Ack {
-                    message: format!("{peer_id} unmarked as trusted contact"),
-                }
+                self.handle_set_trusted_contact(peer_id, false).await
             }
         }
     }
@@ -706,77 +292,22 @@ impl App {
         rooms: Vec<RoomSummary>,
         network: NetworkSummary,
     ) -> Result<()> {
-        self.persistence.save_full(&PersistedState {
-            local_display_name: Some(local_display_name),
+        self.persistence.save_full(&persisted_state_from_network(
+            local_display_name,
             rooms,
-            known_peer_addrs: network.saved_peer_addrs,
-            known_peers: network.known_peers,
-            ignored_peer_ids: network.ignored_peer_ids,
-            last_share_invite: network.direct_call_invite,
-            path_scores: network.path_scores,
-        })
+            network,
+        ))
     }
 
     async fn persist_state(&self) -> Result<()> {
         let state = self.state.read().await;
-        self.persistence.save_full(&PersistedState {
-            local_display_name: Some(state.session.display_name.clone()),
-            rooms: state.rooms.clone(),
-            known_peer_addrs: state.network.saved_peer_addrs.clone(),
-            known_peers: state.network.known_peers.clone(),
-            ignored_peer_ids: state.network.ignored_peer_ids.clone(),
-            last_share_invite: state.network.direct_call_invite.clone(),
-            path_scores: state.network.path_scores.clone(),
-        })
+        self.persistence
+            .save_full(&persisted_state_from_status(&state))
     }
 
-    async fn seed_invite_hints(&self, invite: CompactInviteV1) {
+    async fn seed_invite_hints(&self, invite: voicers_core::CompactInviteV1) {
         let mut state = self.state.write().await;
-        state
-            .network
-            .ignored_peer_ids
-            .retain(|id| id != &invite.peer_id);
-
-        let peer_index = state
-            .network
-            .known_peers
-            .iter()
-            .position(|peer| peer.peer_id == invite.peer_id)
-            .unwrap_or_else(|| {
-                state.network.known_peers.push(voicers_core::KnownPeerSummary {
-                    peer_id: invite.peer_id.clone(),
-                    display_name: format!(
-                        "peer {}",
-                        invite.peer_id.get(0..12).unwrap_or(&invite.peer_id)
-                    ),
-                    addresses: Vec::new(),
-                    last_dial_addr: None,
-                    connected: false,
-                    pinned: false,
-                    seen: false,
-                    whitelisted: false,
-                    trusted_contact: false,
-                });
-                state.network.known_peers.len() - 1
-            });
-
-        for address in invite.addrs {
-            let address = address.trim().to_string();
-            if address.is_empty() {
-                continue;
-            }
-            if !state.network.saved_peer_addrs.contains(&address) {
-                state.network.saved_peer_addrs.push(address.clone());
-            }
-            let known_peer = &mut state.network.known_peers[peer_index];
-            if !known_peer.addresses.contains(&address) {
-                known_peer.addresses.push(address.clone());
-            }
-            if known_peer.last_dial_addr.is_none() {
-                known_peer.last_dial_addr = Some(address);
-            }
-        }
-        state.network.refresh_user_views();
+        seed_invite_hints(&mut state, invite);
     }
 
     #[doc(hidden)]
@@ -809,182 +340,415 @@ impl App {
             },
         });
     }
-}
 
-fn fresh_invite_code(peer_id: &str) -> (String, u64) {
-    let now_ms = now_ms();
-    let expires_at_ms = now_ms.saturating_add(60 * 60 * 1000);
-    let seed = format!("{peer_id}:{now_ms}");
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
-    use std::hash::{Hash, Hasher};
-    seed.hash(&mut hash);
-    let code = format!("{:08x}", hash.finish())[..8].to_ascii_lowercase();
-    (code, expires_at_ms)
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
-}
-
-fn normalize_room_name(room_name: &str) -> String {
-    let normalized = room_name.trim();
-    if normalized.is_empty() {
-        "main".to_string()
-    } else {
-        normalized.to_string()
-    }
-}
-
-fn engage_room(
-    state: &mut DaemonStatus,
-    room_name: &str,
-    local_peer_id: &str,
-    display_name: &str,
-) {
-    for room in &mut state.rooms {
-        room.engaged = room.name == room_name;
-    }
-
-    if let Some(room) = state.rooms.iter_mut().find(|room| room.name == room_name) {
-        room.engaged = true;
-        ensure_admin_role(room);
-        ensure_local_member(room, local_peer_id, display_name, true);
-        return;
-    }
-
-    let mut room = RoomSummary {
-        name: room_name.to_string(),
-        engaged: true,
-        roles: Vec::new(),
-        members: Vec::new(),
-        current_invite: None,
-    };
-    ensure_admin_role(&mut room);
-    ensure_local_member(&mut room, local_peer_id, display_name, true);
-    state.rooms.push(room);
-    state.rooms.sort_by(|left, right| left.name.cmp(&right.name));
-}
-
-fn set_room_invite(
-    state: &mut DaemonStatus,
-    room_name: &str,
-    invite_code: String,
-    expires_at_ms: Option<u64>,
-) {
-    if let Some(room) = state.rooms.iter_mut().find(|room| room.name == room_name) {
-        room.current_invite = Some(RoomInviteSummary {
-            invite_code,
-            share_invite: None,
-            expires_at_ms,
-            created_by_peer_id: Some(state.local_peer_id.clone()),
-        });
-    }
-}
-
-fn clear_room_invite(state: &mut DaemonStatus, room_name: &str) {
-    if let Some(room) = state.rooms.iter_mut().find(|room| room.name == room_name) {
-        room.current_invite = None;
-    }
-}
-
-fn room_has_permission(
-    state: &DaemonStatus,
-    room_name: &str,
-    peer_id: &str,
-    permission: RoomPermission,
-) -> bool {
-    let Some(room) = state.rooms.iter().find(|room| room.name == room_name) else {
-        return false;
-    };
-    let Some(member) = room.members.iter().find(|member| member.peer_id == peer_id) else {
-        return false;
-    };
-
-    member.roles.iter().any(|role_name| {
-        room.roles
-            .iter()
-            .find(|role| role.name == *role_name)
-            .map(|role| role.permissions.iter().any(|candidate| candidate == &permission))
-            .unwrap_or(false)
-    })
-}
-
-fn ensure_admin_role(room: &mut RoomSummary) {
-    if room.roles.iter().any(|role| role.name == "admin") {
-        return;
-    }
-
-    room.roles.push(RoomRoleSummary {
-        name: "admin".to_string(),
-        permissions: vec![
-            RoomPermission::CreateRoomInvite,
-            RoomPermission::CreateRole,
-            RoomPermission::EditRole,
-            RoomPermission::AssignRole,
-        ],
-    });
-}
-
-fn ensure_local_member(
-    room: &mut RoomSummary,
-    local_peer_id: &str,
-    display_name: &str,
-    seed_admin: bool,
-) {
-    let maybe_member = room
-        .members
-        .iter_mut()
-        .find(|member| member.peer_id == local_peer_id || member.peer_id.is_empty());
-
-    match maybe_member {
-        Some(member) => {
-            member.peer_id = local_peer_id.to_string();
-            member.display_name = display_name.to_string();
-            if seed_admin && !member.roles.iter().any(|role| role == "admin") {
-                member.roles.push("admin".to_string());
-            }
-        }
-        None => room.members.push(RoomMemberSummary {
-            peer_id: local_peer_id.to_string(),
-            display_name: display_name.to_string(),
-            roles: if seed_admin {
-                vec!["admin".to_string()]
+    async fn handle_create_room(&self, room_name: String) -> ControlResponse {
+        let normalized_room = normalize_room_name(&room_name);
+        let hello = {
+            let mut state = self.state.write().await;
+            let local_peer_id = state.local_peer_id.clone();
+            let display_name = state.session.display_name.clone();
+            create_or_update_room(&mut state, &normalized_room, &local_peer_id, &display_name);
+            state.session.room_name = Some(normalized_room.clone());
+            if normalized_room != "main" {
+                let (invite_code, expires_at_ms) = fresh_invite_code(&state.local_peer_id);
+                set_room_invite(
+                    &mut state,
+                    &normalized_room,
+                    invite_code,
+                    Some(expires_at_ms),
+                );
             } else {
-                Vec::new()
-            },
-        }),
+                clear_room_invite(&mut state, &normalized_room);
+            }
+            update_share_invite(&mut state);
+            build_local_hello(&state)
+        };
+        let _ = self.network.broadcast_session_hello(hello).await;
+        let _ = self.persist_state().await;
+        ControlResponse::Ack {
+            message: format!("room set to {normalized_room}"),
+        }
     }
-}
 
-fn sync_local_room_memberships(rooms: &mut [RoomSummary], local_peer_id: &str, display_name: &str) {
-    for room in rooms {
-        ensure_admin_role(room);
-        if room.engaged || room.members.iter().any(|member| member.peer_id == local_peer_id) {
-            ensure_local_member(room, local_peer_id, display_name, room.members.is_empty());
+    async fn handle_join_peer(&self, address: String) -> ControlResponse {
+        let mut adopted_room = None;
+        let dial_target = match parse_join_target(&address) {
+            JoinTarget::Raw(target) => target,
+            JoinTarget::Invite(invite) => {
+                let has_addrs = !invite.addrs.is_empty();
+                if matches!(invite.kind, CompactInviteKind::Room) {
+                    adopted_room = invite.room_name.clone();
+                }
+                let code_target = match invite.kind {
+                    CompactInviteKind::DirectCall => None,
+                    CompactInviteKind::Room if !has_addrs => invite
+                        .invite_code
+                        .clone()
+                        .filter(|_| invite.expires_at_ms.unwrap_or(u64::MAX) > now_ms())
+                        .or_else(|| invite.room_name.clone()),
+                    CompactInviteKind::Room => None,
+                };
+                let peer_id = invite.peer_id.clone();
+                self.seed_invite_hints(invite).await;
+                code_target.unwrap_or(peer_id)
+            }
+        };
+
+        if let Some(room_name) = adopted_room {
+            self.adopt_room_invite(room_name).await;
+        }
+
+        match self.network.dial(dial_target).await {
+            Ok(message) => ControlResponse::Ack { message },
+            Err(error) => ControlResponse::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    async fn adopt_room_invite(&self, room_name: String) {
+        let normalized_room = normalize_room_name(&room_name);
+        {
+            let mut state = self.state.write().await;
+            let local_peer_id = state.local_peer_id.clone();
+            let display_name = state.session.display_name.clone();
+            create_or_update_room(&mut state, &normalized_room, &local_peer_id, &display_name);
+            state.session.room_name = Some(normalized_room);
+        }
+        let _ = self.persist_state().await;
+    }
+
+    async fn handle_toggle_mute_self(&self) -> ControlResponse {
+        let mut state = self.state.write().await;
+        state.session.self_muted = !state.session.self_muted;
+        let label = if state.session.self_muted {
+            "self muted"
         } else {
-            for member in &mut room.members {
-                if member.peer_id == local_peer_id {
-                    member.display_name = display_name.to_string();
+            "self unmuted"
+        };
+        ControlResponse::Ack {
+            message: label.to_string(),
+        }
+    }
+
+    async fn handle_toggle_mute_peer(&self, peer_id: String) -> ControlResponse {
+        let mut state = self.state.write().await;
+        match state.peers.iter_mut().find(|peer| peer.peer_id == peer_id) {
+            Some(peer) => {
+                peer.muted = !peer.muted;
+                let label = if peer.muted { "muted" } else { "unmuted" };
+                ControlResponse::Ack {
+                    message: format!("{} {label}", peer.display_name),
                 }
             }
+            None => ControlResponse::Error {
+                message: "peer not found".to_string(),
+            },
         }
     }
-}
 
-fn build_local_hello(state: &DaemonStatus) -> SessionHello {
-    let trusted_contacts = state
-        .network
-        .known_peers
-        .iter()
-        .filter(|p| p.trusted_contact)
-        .map(|p| p.peer_id.clone())
-        .collect();
-    SessionHello {
-        room_name: state.session.room_name.clone(),
-        display_name: state.session.display_name.clone(),
-        trusted_contacts,
+    async fn handle_set_display_name(&self, display_name: String) -> ControlResponse {
+        let new_name = display_name.trim().to_string();
+        if new_name.is_empty() {
+            return ControlResponse::Error {
+                message: "display name cannot be empty".to_string(),
+            };
+        }
+
+        let hello = {
+            let mut state = self.state.write().await;
+            state.session.display_name = new_name.clone();
+            let local_peer_id = state.local_peer_id.clone();
+            let display_name = state.session.display_name.clone();
+            sync_local_room_memberships(&mut state.rooms, &local_peer_id, &display_name);
+            build_local_hello(&state)
+        };
+
+        let _ = self.network.broadcast_session_hello(hello).await;
+        let _ = self.persist_state().await;
+        ControlResponse::Ack {
+            message: format!("nickname set to {new_name}"),
+        }
+    }
+
+    async fn handle_send_webrtc_signal(
+        &self,
+        peer_id: String,
+        signal: voicers_core::WebRtcSignal,
+    ) -> ControlResponse {
+        let signal_kind = signal.kind();
+        match self
+            .network
+            .send_webrtc_signal(peer_id.clone(), signal)
+            .await
+        {
+            Ok(()) => ControlResponse::Ack {
+                message: format!("sent WebRTC {signal_kind} signal to {peer_id}"),
+            },
+            Err(error) => ControlResponse::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    async fn handle_start_webrtc_offer(&self, peer_id: String) -> ControlResponse {
+        match self.network.start_webrtc_offer(peer_id.clone()).await {
+            Ok(()) => ControlResponse::Ack {
+                message: format!("started WebRTC offer for {peer_id}"),
+            },
+            Err(error) => ControlResponse::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    async fn handle_set_input_gain_percent(&self, percent: u8) -> ControlResponse {
+        let percent = percent.min(200);
+        match self.media.set_input_gain_percent(percent).await {
+            Ok(()) => {
+                let mut state = self.state.write().await;
+                state.audio.input_gain_percent = percent;
+                ControlResponse::Ack {
+                    message: format!("input gain set to {percent}%"),
+                }
+            }
+            Err(error) => ControlResponse::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    async fn handle_select_capture_device(&self, device_name: String) -> ControlResponse {
+        match self.media.select_capture_device(device_name).await {
+            Ok(selected_name) => {
+                let mut state = self.state.write().await;
+                state.audio.capture_device = Some(selected_name.clone());
+                ControlResponse::Ack {
+                    message: format!("capture device set to {selected_name}"),
+                }
+            }
+            Err(error) => ControlResponse::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    async fn handle_set_peer_volume_percent(
+        &self,
+        peer_id: String,
+        percent: u8,
+    ) -> ControlResponse {
+        let percent = percent.min(200);
+        let mut state = self.state.write().await;
+        match state.peers.iter_mut().find(|peer| peer.peer_id == peer_id) {
+            Some(peer) => {
+                peer.output_volume_percent = percent;
+                ControlResponse::Ack {
+                    message: format!("{} volume set to {percent}%", peer.display_name),
+                }
+            }
+            None => ControlResponse::Error {
+                message: "peer not found".to_string(),
+            },
+        }
+    }
+
+    async fn handle_save_known_peer(&self, peer_id: String) -> ControlResponse {
+        let mut state = self.state.write().await;
+        let known_peer = match save_known_peer(&mut state, &peer_id) {
+            Ok(display_name) => display_name,
+            Err(message) => return ControlResponse::Error { message },
+        };
+        let snapshot = state.network.clone();
+        let local_display_name = state.session.display_name.clone();
+        let rooms = state.rooms.clone();
+        drop(state);
+        let _ = self.persist_network(local_display_name, rooms, snapshot);
+        ControlResponse::Ack {
+            message: format!("{known_peer} added to friends"),
+        }
+    }
+
+    async fn handle_rename_known_peer(
+        &self,
+        peer_id: String,
+        display_name: String,
+    ) -> ControlResponse {
+        let new_name = display_name.trim().to_string();
+        if new_name.is_empty() {
+            return ControlResponse::Error {
+                message: "display name cannot be empty".to_string(),
+            };
+        }
+        let mut state = self.state.write().await;
+        if let Err(message) = rename_known_peer(&mut state, &peer_id, &new_name) {
+            return ControlResponse::Error { message };
+        }
+        let snapshot = state.network.clone();
+        let local_display_name = state.session.display_name.clone();
+        let rooms = state.rooms.clone();
+        drop(state);
+        let _ = self.persist_network(local_display_name, rooms, snapshot);
+        ControlResponse::Ack {
+            message: format!("friend renamed to {new_name}"),
+        }
+    }
+
+    async fn handle_forget_known_peer(&self, peer_id: String) -> ControlResponse {
+        let mut state = self.state.write().await;
+        if let Err(message) = forget_known_peer(&mut state, &peer_id) {
+            return ControlResponse::Error { message };
+        }
+        let snapshot = state.network.clone();
+        let local_display_name = state.session.display_name.clone();
+        let rooms = state.rooms.clone();
+        drop(state);
+        let _ = self.persist_network(local_display_name, rooms, snapshot);
+        ControlResponse::Ack {
+            message: "friend removed".to_string(),
+        }
+    }
+
+    async fn handle_approve_pending_peer(
+        &self,
+        peer_id: String,
+        whitelist: bool,
+    ) -> ControlResponse {
+        let response = self.network.approve_pending_peer(peer_id.clone()).await;
+        if response.is_ok() && whitelist {
+            {
+                let mut state = self.state.write().await;
+                if let Some(peer) = state
+                    .network
+                    .known_peers
+                    .iter_mut()
+                    .find(|peer| peer.peer_id == peer_id)
+                {
+                    peer.whitelisted = true;
+                }
+                state.network.refresh_user_views();
+                state
+                    .pending_peer_approvals
+                    .retain(|pending| pending.peer_id != peer_id);
+            }
+            let _ = self.persist_state().await;
+        } else if response.is_ok() {
+            let mut state = self.state.write().await;
+            state
+                .pending_peer_approvals
+                .retain(|pending| pending.peer_id != peer_id);
+        }
+
+        match response {
+            Ok(message) => ControlResponse::Ack {
+                message: if whitelist {
+                    format!("{message}; peer whitelisted")
+                } else {
+                    message
+                },
+            },
+            Err(error) => ControlResponse::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    async fn handle_reject_pending_peer(&self, peer_id: String) -> ControlResponse {
+        let response = self.network.reject_pending_peer(peer_id.clone()).await;
+        if response.is_ok() {
+            let mut state = self.state.write().await;
+            state
+                .pending_peer_approvals
+                .retain(|pending| pending.peer_id != peer_id);
+        }
+        match response {
+            Ok(message) => ControlResponse::Ack { message },
+            Err(error) => ControlResponse::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    async fn handle_rotate_invite_code(&self) -> ControlResponse {
+        let hello_and_invite = {
+            let mut state = self.state.write().await;
+            if state.session.room_name.as_deref() == Some("main")
+                || state
+                    .session
+                    .room_name
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                return ControlResponse::Error {
+                    message: "room invite rotation requires a custom room name".to_string(),
+                };
+            }
+            let current_room = state
+                .session
+                .room_name
+                .clone()
+                .unwrap_or_else(|| "main".to_string());
+            if !room_has_permission(
+                &state,
+                &current_room,
+                &state.local_peer_id,
+                RoomPermission::CreateRoomInvite,
+            ) {
+                return ControlResponse::Error {
+                    message: "only room admins can create room invites".to_string(),
+                };
+            }
+            let (invite_code, expires_at_ms) = fresh_invite_code(&state.local_peer_id);
+            set_room_invite(
+                &mut state,
+                &current_room,
+                invite_code.clone(),
+                Some(expires_at_ms),
+            );
+            update_share_invite(&mut state);
+            (build_local_hello(&state), invite_code)
+        };
+
+        let _ = self
+            .network
+            .broadcast_session_hello(hello_and_invite.0)
+            .await;
+        let _ = self.persist_state().await;
+        ControlResponse::Ack {
+            message: format!("room invite rotated to {}", hello_and_invite.1),
+        }
+    }
+
+    async fn handle_set_trusted_contact(
+        &self,
+        peer_id: String,
+        trusted_contact: bool,
+    ) -> ControlResponse {
+        let hello = {
+            let mut state = self.state.write().await;
+            if let Err(message) = set_trusted_contact(&mut state, &peer_id, trusted_contact) {
+                return ControlResponse::Error { message };
+            }
+            build_local_hello(&state)
+        };
+        let snapshot = {
+            let state = self.state.read().await;
+            (
+                state.session.display_name.clone(),
+                state.rooms.clone(),
+                state.network.clone(),
+            )
+        };
+        let _ = self.persist_network(snapshot.0, snapshot.1, snapshot.2);
+        let _ = self.network.broadcast_session_hello(hello).await;
+        let action = if trusted_contact {
+            "marked as trusted contact"
+        } else {
+            "unmarked as trusted contact"
+        };
+        ControlResponse::Ack {
+            message: format!("{peer_id} {action}"),
+        }
     }
 }

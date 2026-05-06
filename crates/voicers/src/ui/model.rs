@@ -205,7 +205,10 @@ impl UiApp {
         let len = self
             .status
             .as_ref()
-            .map(|status| main_activity_items(status, &self.expanded_main_rooms, self.expanded_main_calls).len())
+            .map(|status| {
+                main_activity_items(status, &self.expanded_main_rooms, self.expanded_main_calls)
+                    .len()
+            })
             .unwrap_or(0);
         if len == 0 {
             self.selected_main_item = 0;
@@ -290,13 +293,11 @@ impl UiApp {
                     .cloned()
                     .map(ConfigItem::CaptureDevice),
             );
-            items.extend(
-                visible_voice_peers(status)
-                    .into_iter()
-                    .map(|peer| ConfigItem::PeerVolume {
-                        peer_id: peer.peer_id.clone(),
-                    }),
-            );
+            items.extend(visible_voice_peers(status).into_iter().map(|peer| {
+                ConfigItem::PeerVolume {
+                    peer_id: peer.peer_id.clone(),
+                }
+            }));
         }
         items
     }
@@ -362,9 +363,10 @@ pub fn main_activity_items(
         let room_peers: Vec<PeerSummary> = visible_voice_peers(status)
             .into_iter()
             .filter(|peer| match &peer.session {
-                PeerSessionState::Active { room_name: peer_room, .. } => {
-                    peer_room.as_deref().unwrap_or("main") == room_name
-                }
+                PeerSessionState::Active {
+                    room_name: peer_room,
+                    ..
+                } => peer_room.as_deref().unwrap_or("main") == room_name,
                 _ => false,
             })
             .cloned()
@@ -422,7 +424,13 @@ pub fn known_rooms(status: &DaemonStatus) -> Vec<KnownRoomPreview> {
             }
             PeerSessionState::None | PeerSessionState::Handshaking => continue,
         };
-        upsert_room(&mut rooms, &room_name, room_name == current_room, true, false);
+        upsert_room(
+            &mut rooms,
+            &room_name,
+            room_name == current_room,
+            true,
+            false,
+        );
     }
 
     for pending in &status.pending_peer_approvals {
@@ -430,7 +438,13 @@ pub fn known_rooms(status: &DaemonStatus) -> Vec<KnownRoomPreview> {
             .room_name
             .clone()
             .unwrap_or_else(|| "main".to_string());
-        upsert_room(&mut rooms, &room_name, room_name == current_room, false, true);
+        upsert_room(
+            &mut rooms,
+            &room_name,
+            room_name == current_room,
+            false,
+            true,
+        );
     }
 
     rooms.sort_by(|left, right| {

@@ -309,8 +309,7 @@ pub async fn start(
         state.audio.source = Some("generated-tone-fallback".to_string());
         insert_unique_note(
             &mut state,
-            "microphone capture disabled for this daemon instance; using fallback tone"
-                .to_string(),
+            "microphone capture disabled for this daemon instance; using fallback tone".to_string(),
         );
         None
     } else {

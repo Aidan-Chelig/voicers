@@ -58,7 +58,10 @@ enum WebRtcPathState {
 
 pub(super) enum Route {
     Direct,
-    Relayed { via: libp2p::PeerId, destination: libp2p::PeerId },
+    Relayed {
+        via: libp2p::PeerId,
+        destination: libp2p::PeerId,
+    },
     Unreachable,
 }
 
@@ -67,10 +70,14 @@ pub(super) fn resolve_route(
     relay_offers: &HashMap<String, Vec<String>>,
     target: &str,
 ) -> Route {
-    let known = state.network.known_peers.iter().find(|p| p.peer_id == target);
+    let known = state
+        .network
+        .known_peers
+        .iter()
+        .find(|p| p.peer_id == target);
 
     if let Some(peer) = known {
-        if peer.trusted_contact && peer.connected && target.parse::<libp2p::PeerId>().is_ok() {
+        if peer.connected && target.parse::<libp2p::PeerId>().is_ok() {
             return Route::Direct;
         }
     }
@@ -105,8 +112,14 @@ pub(super) fn resolve_route(
     candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.peer_id.cmp(&b.0.peer_id)));
 
     let via_str = &candidates[0].0.peer_id;
-    if let (Ok(via), Ok(dest)) = (via_str.parse::<libp2p::PeerId>(), target.parse::<libp2p::PeerId>()) {
-        Route::Relayed { via, destination: dest }
+    if let (Ok(via), Ok(dest)) = (
+        via_str.parse::<libp2p::PeerId>(),
+        target.parse::<libp2p::PeerId>(),
+    ) {
+        Route::Relayed {
+            via,
+            destination: dest,
+        }
     } else {
         Route::Unreachable
     }
@@ -653,17 +666,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_route_unreachable_when_not_trusted() {
+    fn resolve_route_direct_when_connected_even_if_not_trusted() {
         let status = make_route_status(vec![peer(TARGET, false, true)]);
         let offers = HashMap::new();
-        assert!(matches!(resolve_route(&status, &offers, TARGET), Route::Unreachable));
+        assert!(matches!(resolve_route(&status, &offers, TARGET), Route::Direct));
     }
 
     #[test]
     fn resolve_route_unreachable_when_trusted_but_disconnected() {
         let status = make_route_status(vec![peer(TARGET, true, false)]);
         let offers = HashMap::new();
-        assert!(matches!(resolve_route(&status, &offers, TARGET), Route::Unreachable));
+        assert!(matches!(
+            resolve_route(&status, &offers, TARGET),
+            Route::Unreachable
+        ));
     }
 
     #[test]
@@ -684,7 +700,10 @@ mod tests {
         let status = make_route_status(vec![peer(TARGET, false, false), peer(BOB, true, false)]);
         let mut offers = HashMap::new();
         offers.insert(BOB.to_string(), vec![TARGET.to_string()]);
-        assert!(matches!(resolve_route(&status, &offers, TARGET), Route::Unreachable));
+        assert!(matches!(
+            resolve_route(&status, &offers, TARGET),
+            Route::Unreachable
+        ));
     }
 
     #[test]
@@ -694,18 +713,24 @@ mod tests {
             peer(BOB, true, true),
             peer(CAROL, true, true),
         ]);
-        status.network.path_scores.push(voicers_core::PathScoreSummary {
-            path: LIBP2P_RELAY_PATH.to_string(),
-            successes: 5,
-            failures: 0,
-            last_peer_id: Some(BOB.to_string()),
-        });
-        status.network.path_scores.push(voicers_core::PathScoreSummary {
-            path: LIBP2P_RELAY_PATH.to_string(),
-            successes: 1,
-            failures: 0,
-            last_peer_id: Some(CAROL.to_string()),
-        });
+        status
+            .network
+            .path_scores
+            .push(voicers_core::PathScoreSummary {
+                path: LIBP2P_RELAY_PATH.to_string(),
+                successes: 5,
+                failures: 0,
+                last_peer_id: Some(BOB.to_string()),
+            });
+        status
+            .network
+            .path_scores
+            .push(voicers_core::PathScoreSummary {
+                path: LIBP2P_RELAY_PATH.to_string(),
+                successes: 1,
+                failures: 0,
+                last_peer_id: Some(CAROL.to_string()),
+            });
         let mut offers = HashMap::new();
         offers.insert(BOB.to_string(), vec![TARGET.to_string()]);
         offers.insert(CAROL.to_string(), vec![TARGET.to_string()]);
@@ -729,7 +754,10 @@ mod tests {
         let status = make_route_status(vec![peer(TARGET, false, false), peer(BOB, true, true)]);
         let mut offers = HashMap::new();
         offers.insert(BOB.to_string(), vec![CAROL.to_string()]);
-        assert!(matches!(resolve_route(&status, &offers, TARGET), Route::Unreachable));
+        assert!(matches!(
+            resolve_route(&status, &offers, TARGET),
+            Route::Unreachable
+        ));
     }
 
     #[test]
@@ -737,7 +765,10 @@ mod tests {
         let status = make_route_status(vec![peer(TARGET, false, false), peer(BOB, true, true)]);
         let mut offers = HashMap::new();
         offers.insert(BOB.to_string(), vec![]);
-        assert!(matches!(resolve_route(&status, &offers, TARGET), Route::Unreachable));
+        assert!(matches!(
+            resolve_route(&status, &offers, TARGET),
+            Route::Unreachable
+        ));
     }
 
     #[test]
